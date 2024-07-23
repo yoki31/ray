@@ -21,14 +21,14 @@ InboundRequest::InboundRequest() {}
 
 InboundRequest::InboundRequest(
     std::function<void(rpc::SendReplyCallback)> accept_callback,
-    std::function<void(rpc::SendReplyCallback)> reject_callback,
-    std::function<void(rpc::SendReplyCallback)> steal_callback,
-    rpc::SendReplyCallback send_reply_callback, class TaskID task_id,
-    bool has_dependencies, const std::string &concurrency_group_name,
+    std::function<void(const Status &, rpc::SendReplyCallback)> reject_callback,
+    rpc::SendReplyCallback send_reply_callback,
+    class TaskID task_id,
+    bool has_dependencies,
+    const std::string &concurrency_group_name,
     const ray::FunctionDescriptor &function_descriptor)
     : accept_callback_(std::move(accept_callback)),
       reject_callback_(std::move(reject_callback)),
-      steal_callback_(std::move(steal_callback)),
       send_reply_callback_(std::move(send_reply_callback)),
       task_id_(task_id),
       concurrency_group_name_(concurrency_group_name),
@@ -36,12 +36,8 @@ InboundRequest::InboundRequest(
       has_pending_dependencies_(has_dependencies) {}
 
 void InboundRequest::Accept() { accept_callback_(std::move(send_reply_callback_)); }
-void InboundRequest::Cancel() { reject_callback_(std::move(send_reply_callback_)); }
-void InboundRequest::Steal(rpc::StealTasksReply *reply) {
-  reply->add_stolen_tasks_ids(task_id_.Binary());
-  RAY_CHECK(TaskID::FromBinary(
-                reply->stolen_tasks_ids(reply->stolen_tasks_ids_size() - 1)) == task_id_);
-  steal_callback_(std::move(send_reply_callback_));
+void InboundRequest::Cancel(const Status &status) {
+  reject_callback_(status, std::move(send_reply_callback_));
 }
 
 bool InboundRequest::CanExecute() const { return !has_pending_dependencies_; }

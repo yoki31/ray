@@ -4,13 +4,22 @@ import pytest
 import ray
 
 
+def test_multi_raise_exception_on_non_client(shutdown_only):
+    with pytest.raises(
+        RuntimeError,
+        match=("Do not pass the `allow_multiple` to `ray.init` to fix the issue."),
+    ):
+        ray.init(allow_multiple=True)
+
+
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="PSUtil does not work the same on windows.")
+    sys.platform == "win32", reason="PSUtil does not work the same on windows."
+)
 @pytest.mark.parametrize(
     "call_ray_start",
     ["ray start --head --ray-client-server-port 25001 --port 0"],
-    indirect=True)
+    indirect=True,
+)
 def test_multi_cli_basic(call_ray_start):
     ray.init("ray://localhost:25001")
     cli1 = ray.init("ray://localhost:25001", allow_multiple=True)
@@ -48,19 +57,21 @@ def test_multi_cli_basic(call_ray_start):
 
 
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="PSUtil does not work the same on windows.")
+    sys.platform == "win32", reason="PSUtil does not work the same on windows."
+)
 @pytest.mark.parametrize(
     "call_ray_start",
     ["ray start --head --ray-client-server-port 25001 --port 0"],
-    indirect=True)
+    indirect=True,
+)
 def test_multi_cli_init(call_ray_start):
     cli1 = ray.init("ray://localhost:25001", allow_multiple=True)  # noqa
     with pytest.raises(
-            ValueError,
-            match="The client has already connected to the cluster "
-            "with allow_multiple=True. Please set allow_multiple=True"
-            " to proceed"):
+        ValueError,
+        match="The client has already connected to the cluster "
+        "with allow_multiple=True. Please set allow_multiple=True"
+        " to proceed",
+    ):
         ray.init("ray://localhost:25001")
     cli2 = ray.init("ray://localhost:25001", allow_multiple=True)  # noqa
 
@@ -72,12 +83,13 @@ def test_multi_cli_init(call_ray_start):
 
 
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="PSUtil does not work the same on windows.")
+    sys.platform == "win32", reason="PSUtil does not work the same on windows."
+)
 @pytest.mark.parametrize(
     "call_ray_start",
     ["ray start --head --ray-client-server-port 25001 --port 0"],
-    indirect=True)
+    indirect=True,
+)
 def test_multi_cli_func(call_ray_start):
     @ray.remote
     def hello():
@@ -107,12 +119,13 @@ def test_multi_cli_func(call_ray_start):
 
 
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="PSUtil does not work the same on windows.")
+    sys.platform == "win32", reason="PSUtil does not work the same on windows."
+)
 @pytest.mark.parametrize(
     "call_ray_start",
     ["ray start --head --ray-client-server-port 25001 --port 0"],
-    indirect=True)
+    indirect=True,
+)
 def test_multi_cli_actor(call_ray_start):
     @ray.remote
     class Actor:
@@ -155,14 +168,16 @@ def test_multi_cli_actor(call_ray_start):
 
 
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="PSUtil does not work the same on windows.")
+    sys.platform == "win32", reason="PSUtil does not work the same on windows."
+)
 @pytest.mark.parametrize(
     "call_ray_start",
     ["ray start --head --ray-client-server-port 25001 --port 0"],
-    indirect=True)
+    indirect=True,
+)
 def test_multi_cli_threading(call_ray_start):
     import threading
+
     b = threading.Barrier(2)
     ret = [None, None]
 
@@ -176,8 +191,8 @@ def test_multi_cli_threading(call_ray_start):
             b.wait()
             ret[idx] = v
 
-    t1 = threading.Thread(target=get, args=(0, ))
-    t2 = threading.Thread(target=get, args=(1, ))
+    t1 = threading.Thread(target=get, args=(0,))
+    t2 = threading.Thread(target=get, args=(1,))
     t1.start()
     t2.start()
     t1.join()
@@ -189,5 +204,10 @@ if __name__ == "__main__":
     # The following should be removed after
     # https://github.com/ray-project/ray/issues/20355
     # is fixed.
-    os.environ["RAY_ENABLE_AUTO_CONNECT"] = "0"
-    sys.exit(pytest.main(["-v", __file__]))
+    from ray._private import auto_init_hook
+
+    auto_init_hook.enable_auto_connect = False
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

@@ -9,19 +9,27 @@ import time
 
 from ray.experimental import shuffle
 from ray.tests.conftest import _ray_start_chaos_cluster
-from ray.data.impl.progress_bar import ProgressBar
+from ray.data._internal.progress_bar import ProgressBar
 from ray.util.placement_group import placement_group
-from ray._private.test_utils import get_log_message
+from ray._private.test_utils import (
+    RayletKiller,
+    get_log_message,
+    get_and_run_resource_killer,
+    WorkerKillerActor,
+    wait_for_condition,
+)
 from ray.exceptions import RayTaskError, ObjectLostError
+from ray.util.state.common import ListApiOptions, StateResource
+from ray.util.state.api import StateApiClient, list_nodes
+from ray.cluster_utils import AutoscalingCluster
 
 
 def assert_no_system_failure(p, timeout):
     # Get all logs for 20 seconds.
     logs = get_log_message(p, timeout=timeout)
     for log in logs:
-        assert "SIG" not in log, ("There's the segfault or SIGBART reported.")
-        assert "Check failed" not in log, (
-            "There's the check failure reported.")
+        assert "SIG" not in log, "There's the segfault or SIGBART reported."
+        assert "Check failed" not in log, "There's the check failure reported."
 
 
 @pytest.fixture
@@ -56,13 +64,14 @@ def set_kill_interval(request):
 
 
 @pytest.mark.skip(
-    reason="Skip until https://github.com/ray-project/ray/issues/20706 "
-    "is fixed.")
+    reason="Skip until https://github.com/ray-project/ray/issues/20706 is fixed."
+)
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 @pytest.mark.parametrize(
-    "set_kill_interval", [(True, None), (True, 20), (False, None),
-                          (False, 20)],
-    indirect=True)
+    "set_kill_interval",
+    [(True, None), (True, 20), (False, None), (False, 20)],
+    indirect=True,
+)
 def test_chaos_task_retry(set_kill_interval):
     # Chaos testing.
     @ray.remote(max_retries=-1)
@@ -80,7 +89,7 @@ def test_chaos_task_retry(set_kill_interval):
     # 50MB of return values.
     TOTAL_TASKS = 100
 
-    pb = ProgressBar("Chaos test sanity check", TOTAL_TASKS)
+    pb = ProgressBar("Chaos test sanity check", TOTAL_TASKS, "task")
     results = [invoke_nested_task.remote() for _ in range(TOTAL_TASKS)]
     start = time.time()
     pb.block_until_complete(results)
@@ -94,9 +103,10 @@ def test_chaos_task_retry(set_kill_interval):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 @pytest.mark.parametrize(
-    "set_kill_interval", [(True, None), (True, 20), (False, None),
-                          (False, 20)],
-    indirect=True)
+    "set_kill_interval",
+    [(True, None), (True, 20), (False, None), (False, 20)],
+    indirect=True,
+)
 def test_chaos_actor_retry(set_kill_interval):
     # Chaos testing.
     @ray.remote(num_cpus=0.25, max_restarts=-1, max_task_retries=-1)
@@ -110,7 +120,7 @@ def test_chaos_actor_retry(set_kill_interval):
     NUM_CPUS = 16
     TOTAL_TASKS = 300
 
-    pb = ProgressBar("Chaos test sanity check", TOTAL_TASKS * NUM_CPUS)
+    pb = ProgressBar("Chaos test sanity check", TOTAL_TASKS * NUM_CPUS, "task")
     actors = [Actor.remote() for _ in range(NUM_CPUS)]
     results = []
     for a in actors:
@@ -128,12 +138,11 @@ def test_chaos_actor_retry(set_kill_interval):
 
 def test_chaos_defer(monkeypatch, ray_start_cluster):
     with monkeypatch.context() as m:
-        m.setenv("RAY_grpc_based_resource_broadcast", "true")
         # defer for 3s
         m.setenv(
             "RAY_testing_asio_delay_us",
-            "NodeManagerService.grpc_client.PrepareBundleResources"
-            "=2000000:2000000")
+            "NodeManagerService.grpc_client.PrepareBundleResources=2000000:2000000",
+        )
         m.setenv("RAY_event_stats", "true")
         cluster = ray_start_cluster
         cluster.add_node(num_cpus=1, object_store_memory=1e9)
@@ -167,7 +176,8 @@ class ShuffleStatusTracker:
                 self.map_refs,
                 timeout=1,
                 num_returns=len(self.map_refs),
-                fetch_local=False)
+                fetch_local=False,
+            )
             if ready:
                 print("Still waiting on map refs", self.map_refs)
             self.num_map += len(ready)
@@ -176,7 +186,8 @@ class ShuffleStatusTracker:
                 self.reduce_refs,
                 timeout=1,
                 num_returns=len(self.reduce_refs),
-                fetch_local=False)
+                fetch_local=False,
+            )
             if ready:
                 print("Still waiting on reduce refs", self.reduce_refs)
             self.num_reduce += len(ready)
@@ -185,7 +196,8 @@ class ShuffleStatusTracker:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 @pytest.mark.parametrize(
-    "set_kill_interval", [(False, None), (False, 60)], indirect=True)
+    "set_kill_interval", [(False, None), (False, 60)], indirect=True
+)
 def test_nonstreaming_shuffle(set_kill_interval):
     lineage_reconstruction_enabled, kill_interval, _ = set_kill_interval
     try:
@@ -194,14 +206,16 @@ def test_nonstreaming_shuffle(set_kill_interval):
         ray.get(tracker.get_progress.remote())
         assert len(ray.nodes()) == 1, (
             "Tracker actor may have been scheduled to remote node "
-            "and may get killed during the test")
+            "and may get killed during the test"
+        )
 
         shuffle.run(
             ray_address="auto",
             no_streaming=True,
             num_partitions=200,
             partition_size=1e6,
-            tracker=tracker)
+            tracker=tracker,
+        )
     except (RayTaskError, ObjectLostError):
         assert kill_interval is not None
         assert not lineage_reconstruction_enabled
@@ -210,9 +224,10 @@ def test_nonstreaming_shuffle(set_kill_interval):
 @pytest.mark.skip(reason="https://github.com/ray-project/ray/issues/20713")
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 @pytest.mark.parametrize(
-    "set_kill_interval", [(True, None), (True, 60), (False, None),
-                          (False, 60)],
-    indirect=True)
+    "set_kill_interval",
+    [(True, None), (True, 60), (False, None), (False, 60)],
+    indirect=True,
+)
 def test_streaming_shuffle(set_kill_interval):
     lineage_reconstruction_enabled, kill_interval, _ = set_kill_interval
     try:
@@ -221,14 +236,16 @@ def test_streaming_shuffle(set_kill_interval):
         ray.get(tracker.get_progress.remote())
         assert len(ray.nodes()) == 1, (
             "Tracker actor may have been scheduled to remote node "
-            "and may get killed during the test")
+            "and may get killed during the test"
+        )
 
         shuffle.run(
             ray_address="auto",
             no_streaming=False,
             num_partitions=200,
             partition_size=1e6,
-            tracker=tracker)
+            tracker=tracker,
+        )
     except (RayTaskError, ObjectLostError):
         assert kill_interval is not None
 
@@ -236,6 +253,115 @@ def test_streaming_shuffle(set_kill_interval):
         # assert not lineage_reconstruction_enabled
 
 
+def test_worker_killer():
+    ray.init()
+
+    task_name = "worker_to_kill"
+
+    @ray.remote
+    def worker_to_kill():
+        time.sleep(3)
+
+    # Run WorkerKillerActor to kill 3 tasks, and run remote "worker_to_kill"
+    # task with max_retries=3. 4 tasks in total (1 initial + 3 retries).
+    # First 3 tasks will be killed, the last retry will succeed.
+    worker_killer = get_and_run_resource_killer(
+        WorkerKillerActor,
+        1,
+        max_to_kill=3,
+        kill_filter_fn=lambda: lambda task: task.name == task_name,
+    )
+    worker_to_kill.options(name=task_name, max_retries=3).remote()
+
+    def check():
+        tasks = StateApiClient().list(
+            StateResource.TASKS,
+            options=ListApiOptions(filters=[("name", "=", task_name)]),
+            raise_on_missing_output=False,
+        )
+        failed = 0
+        finished = 0
+        for task in tasks:
+            if task.state == "FAILED":
+                failed += 1
+            elif task.state == "FINISHED":
+                finished += 1
+        return failed == 3 and finished == 1
+
+    wait_for_condition(check, timeout=20)
+
+    killed_tasks = ray.get(worker_killer.get_total_killed.remote())
+    assert len(killed_tasks) == 3
+
+    tasks = StateApiClient().list(
+        StateResource.TASKS,
+        options=ListApiOptions(filters=[("name", "=", task_name)]),
+        raise_on_missing_output=False,
+    )
+    for task in tasks:
+        if task.state == "FAILED":
+            assert (task.task_id, task.worker_pid) in killed_tasks
+
+    ray.shutdown()
+
+
+@pytest.mark.parametrize(
+    "autoscaler_v2",
+    [False, True],
+    ids=["v1", "v2"],
+)
+def test_node_killer_filter(autoscaler_v2):
+    # Initialize cluster with 1 head node and 2 worker nodes.
+    try:
+        cluster = AutoscalingCluster(
+            head_resources={"CPU": 0},
+            worker_node_types={
+                "cpu_node": {
+                    "resources": {
+                        "CPU": 1,
+                    },
+                    "node_config": {},
+                    "min_workers": 2,
+                    "max_workers": 2,
+                },
+            },
+            autoscaler_v2=autoscaler_v2,
+            idle_timeout_minutes=999,  # it could idle killed before the killer.
+        )
+        cluster.start()
+        ray.init()
+
+        wait_for_condition(lambda: len(list_nodes()) > 2)
+
+        # Choose random worker node to kill.
+        worker_nodes = [node for node in list_nodes() if not node["is_head_node"]]
+        node_to_kill = random.choice(worker_nodes)
+        node_killer = get_and_run_resource_killer(
+            RayletKiller,
+            1,
+            max_to_kill=1,
+            kill_filter_fn=lambda: lambda node: node["NodeID"] == node_to_kill.node_id,
+        )
+
+        def check_killed():
+            # Check that killed node is consistent across list_nodes()
+            killed = list(ray.get(node_killer.get_total_killed.remote()))
+            dead = [node.node_id for node in list_nodes() if node.state == "DEAD"]
+            if len(killed) != 1 or len(dead) != 1:
+                return False
+            return killed[0] == dead[0] == node_to_kill.node_id
+
+        wait_for_condition(check_killed, timeout=100)
+    finally:
+        cluster.shutdown()
+        ray.shutdown()
+
+
 if __name__ == "__main__":
+    import os
     import pytest
-    sys.exit(pytest.main(["-v", __file__]))
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

@@ -33,8 +33,10 @@ const int kMaxUnhandledErrorScanItems = 1000;
 /// A class that represents a `Get` request.
 class GetRequest {
  public:
-  GetRequest(absl::flat_hash_set<ObjectID> object_ids, size_t num_objects,
-             bool remove_after_get, bool abort_if_any_object_is_exception);
+  GetRequest(absl::flat_hash_set<ObjectID> object_ids,
+             size_t num_objects,
+             bool remove_after_get,
+             bool abort_if_any_object_is_exception);
 
   const absl::flat_hash_set<ObjectID> &ObjectIds() const;
 
@@ -72,8 +74,10 @@ class GetRequest {
   std::condition_variable cv_;
 };
 
-GetRequest::GetRequest(absl::flat_hash_set<ObjectID> object_ids, size_t num_objects,
-                       bool remove_after_get, bool abort_if_any_object_is_exception_)
+GetRequest::GetRequest(absl::flat_hash_set<ObjectID> object_ids,
+                       size_t num_objects,
+                       bool remove_after_get,
+                       bool abort_if_any_object_is_exception_)
     : object_ids_(std::move(object_ids)),
       num_objects_(num_objects),
       remove_after_get_(remove_after_get),
@@ -147,11 +151,14 @@ CoreWorkerMemoryStore::CoreWorkerMemoryStore(
     std::shared_ptr<ReferenceCounter> counter,
     std::shared_ptr<raylet::RayletClient> raylet_client,
     std::function<Status()> check_signals,
-    std::function<void(const RayObject &)> unhandled_exception_handler)
+    std::function<void(const RayObject &)> unhandled_exception_handler,
+    std::function<std::shared_ptr<ray::RayObject>(
+        const ray::RayObject &object, const ObjectID &object_id)> object_allocator)
     : ref_counter_(std::move(counter)),
       raylet_client_(raylet_client),
       check_signals_(check_signals),
-      unhandled_exception_handler_(unhandled_exception_handler) {}
+      unhandled_exception_handler_(unhandled_exception_handler),
+      object_allocator_(std::move(object_allocator)) {}
 
 void CoreWorkerMemoryStore::GetAsync(
     const ObjectID &object_id, std::function<void(std::shared_ptr<RayObject>)> callback) {
@@ -191,9 +198,14 @@ std::shared_ptr<RayObject> CoreWorkerMemoryStore::GetIfExists(const ObjectID &ob
 
 bool CoreWorkerMemoryStore::Put(const RayObject &object, const ObjectID &object_id) {
   std::vector<std::function<void(std::shared_ptr<RayObject>)>> async_callbacks;
-  auto object_entry = std::make_shared<RayObject>(object.GetData(), object.GetMetadata(),
-                                                  object.GetNestedRefs(), true);
-  bool stored_in_direct_memory = true;
+  RAY_LOG(DEBUG) << "Putting object into memory store. objectid is " << object_id;
+  std::shared_ptr<RayObject> object_entry = nullptr;
+  if (object_allocator_ != nullptr) {
+    object_entry = object_allocator_(object, object_id);
+  } else {
+    object_entry = std::make_shared<RayObject>(
+        object.GetData(), object.GetMetadata(), object.GetNestedRefs(), true);
+  }
 
   // TODO(edoakes): we should instead return a flag to the caller to put the object in
   // plasma.
@@ -248,20 +260,29 @@ bool CoreWorkerMemoryStore::Put(const RayObject &object, const ObjectID &object_
     cb(object_entry);
   }
 
-  return stored_in_direct_memory;
+  return true;
 }
 
 Status CoreWorkerMemoryStore::Get(const std::vector<ObjectID> &object_ids,
-                                  int num_objects, int64_t timeout_ms,
-                                  const WorkerContext &ctx, bool remove_after_get,
+                                  int num_objects,
+                                  int64_t timeout_ms,
+                                  const WorkerContext &ctx,
+                                  bool remove_after_get,
                                   std::vector<std::shared_ptr<RayObject>> *results) {
-  return GetImpl(object_ids, num_objects, timeout_ms, ctx, remove_after_get, results,
+  return GetImpl(object_ids,
+                 num_objects,
+                 timeout_ms,
+                 ctx,
+                 remove_after_get,
+                 results,
                  /*abort_if_any_object_is_exception=*/true);
 }
 
 Status CoreWorkerMemoryStore::GetImpl(const std::vector<ObjectID> &object_ids,
-                                      int num_objects, int64_t timeout_ms,
-                                      const WorkerContext &ctx, bool remove_after_get,
+                                      int num_objects,
+                                      int64_t timeout_ms,
+                                      const WorkerContext &ctx,
+                                      bool remove_after_get,
                                       std::vector<std::shared_ptr<RayObject>> *results,
                                       bool abort_if_any_object_is_exception) {
   (*results).resize(object_ids.size(), nullptr);
@@ -308,9 +329,10 @@ Status CoreWorkerMemoryStore::GetImpl(const std::vector<ObjectID> &object_ids,
     size_t required_objects = num_objects - (object_ids.size() - remaining_ids.size());
 
     // Otherwise, create a GetRequest to track remaining objects.
-    get_request =
-        std::make_shared<GetRequest>(std::move(remaining_ids), required_objects,
-                                     remove_after_get, abort_if_any_object_is_exception);
+    get_request = std::make_shared<GetRequest>(std::move(remaining_ids),
+                                               required_objects,
+                                               remove_after_get,
+                                               abort_if_any_object_is_exception);
     for (const auto &object_id : get_request->ObjectIds()) {
       object_get_requests_[object_id].push_back(get_request);
     }
@@ -394,14 +416,19 @@ Status CoreWorkerMemoryStore::GetImpl(const std::vector<ObjectID> &object_ids,
 }
 
 Status CoreWorkerMemoryStore::Get(
-    const absl::flat_hash_set<ObjectID> &object_ids, int64_t timeout_ms,
+    const absl::flat_hash_set<ObjectID> &object_ids,
+    int64_t timeout_ms,
     const WorkerContext &ctx,
     absl::flat_hash_map<ObjectID, std::shared_ptr<RayObject>> *results,
     bool *got_exception) {
   const std::vector<ObjectID> id_vector(object_ids.begin(), object_ids.end());
   std::vector<std::shared_ptr<RayObject>> result_objects;
-  RAY_RETURN_NOT_OK(Get(id_vector, id_vector.size(), timeout_ms, ctx,
-                        /*remove_after_get=*/false, &result_objects));
+  RAY_RETURN_NOT_OK(Get(id_vector,
+                        id_vector.size(),
+                        timeout_ms,
+                        ctx,
+                        /*remove_after_get=*/false,
+                        &result_objects));
 
   for (size_t i = 0; i < id_vector.size(); i++) {
     if (result_objects[i] != nullptr) {
@@ -418,13 +445,19 @@ Status CoreWorkerMemoryStore::Get(
 }
 
 Status CoreWorkerMemoryStore::Wait(const absl::flat_hash_set<ObjectID> &object_ids,
-                                   int num_objects, int64_t timeout_ms,
+                                   int num_objects,
+                                   int64_t timeout_ms,
                                    const WorkerContext &ctx,
                                    absl::flat_hash_set<ObjectID> *ready) {
   std::vector<ObjectID> id_vector(object_ids.begin(), object_ids.end());
   std::vector<std::shared_ptr<RayObject>> result_objects;
   RAY_CHECK(object_ids.size() == id_vector.size());
-  auto status = GetImpl(id_vector, num_objects, timeout_ms, ctx, false, &result_objects,
+  auto status = GetImpl(id_vector,
+                        num_objects,
+                        timeout_ms,
+                        ctx,
+                        false,
+                        &result_objects,
                         /*abort_if_any_object_is_exception=*/false);
   // Ignore TimedOut statuses since we return ready objects explicitly.
   if (!status.IsTimedOut()) {
@@ -444,6 +477,7 @@ void CoreWorkerMemoryStore::Delete(const absl::flat_hash_set<ObjectID> &object_i
                                    absl::flat_hash_set<ObjectID> *plasma_ids_to_delete) {
   absl::MutexLock lock(&mu_);
   for (const auto &object_id : object_ids) {
+    RAY_LOG(DEBUG) << "Delete an object from a memory store. ObjectId: " << object_id;
     auto it = objects_.find(object_id);
     if (it != objects_.end()) {
       if (it->second->IsInPlasmaError()) {
@@ -459,6 +493,7 @@ void CoreWorkerMemoryStore::Delete(const absl::flat_hash_set<ObjectID> &object_i
 void CoreWorkerMemoryStore::Delete(const std::vector<ObjectID> &object_ids) {
   absl::MutexLock lock(&mu_);
   for (const auto &object_id : object_ids) {
+    RAY_LOG(DEBUG) << "Delete an object from a memory store. ObjectId: " << object_id;
     auto it = objects_.find(object_id);
     if (it != objects_.end()) {
       OnDelete(it->second);
@@ -522,10 +557,10 @@ inline void CoreWorkerMemoryStore::EraseObjectAndUpdateStats(const ObjectID &obj
     num_in_plasma_ -= 1;
   } else {
     num_local_objects_ -= 1;
-    used_object_store_memory_ -= it->second->GetSize();
+    num_local_objects_bytes_ -= it->second->GetSize();
   }
   RAY_CHECK(num_in_plasma_ >= 0 && num_local_objects_ >= 0 &&
-            used_object_store_memory_ >= 0);
+            num_local_objects_bytes_ >= 0);
   objects_.erase(it);
 }
 
@@ -537,11 +572,11 @@ inline void CoreWorkerMemoryStore::EmplaceObjectAndUpdateStats(
       num_in_plasma_ += 1;
     } else {
       num_local_objects_ += 1;
-      used_object_store_memory_ += object_entry->GetSize();
+      num_local_objects_bytes_ += object_entry->GetSize();
     }
   }
   RAY_CHECK(num_in_plasma_ >= 0 && num_local_objects_ >= 0 &&
-            used_object_store_memory_ >= 0);
+            num_local_objects_bytes_ >= 0);
 }
 
 MemoryStoreStats CoreWorkerMemoryStore::GetMemoryStoreStatisticalData() {
@@ -549,8 +584,15 @@ MemoryStoreStats CoreWorkerMemoryStore::GetMemoryStoreStatisticalData() {
   MemoryStoreStats item;
   item.num_in_plasma = num_in_plasma_;
   item.num_local_objects = num_local_objects_;
-  item.used_object_store_memory = used_object_store_memory_;
+  item.num_local_objects_bytes = num_local_objects_bytes_;
   return item;
+}
+
+void CoreWorkerMemoryStore::RecordMetrics() {
+  absl::MutexLock lock(&mu_);
+  ray::stats::STATS_object_store_memory.Record(
+      num_local_objects_bytes_,
+      {{ray::stats::LocationKey, ray::stats::kObjectLocWorkerHeap}});
 }
 
 }  // namespace core

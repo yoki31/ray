@@ -1,27 +1,26 @@
 # coding: utf-8
 import logging
+import subprocess
 import sys
 import time
-import subprocess
-
-import numpy as np
-import pytest
-
-import ray.cluster_utils
-from ray._private.gcs_pubsub import gcs_pubsub_enabled, \
-    GcsFunctionKeySubscriber
-from ray._private.test_utils import wait_for_condition
-from ray.autoscaler._private.constants import RAY_PROCESSES
 from pathlib import Path
+import os
+
+import pytest
+from unittest import mock
 
 import ray
+import ray.cluster_utils
+from ray._private.test_utils import wait_for_condition
+from ray.autoscaler._private.constants import RAY_PROCESSES
+
 import psutil
 
 logger = logging.getLogger(__name__)
 
 
 def test_actor_scheduling(shutdown_only):
-    ray.init()
+    ray.init(num_cpus=1)
 
     @ray.remote
     class A:
@@ -33,7 +32,7 @@ def test_actor_scheduling(shutdown_only):
 
     a = A.remote()
     a.run_fail.remote()
-    with pytest.raises(Exception):
+    with pytest.raises(ray.exceptions.RayActorError, match="exit_actor"):
         ray.get([a.get.remote()])
 
 
@@ -44,9 +43,11 @@ def test_worker_startup_count(ray_start_cluster):
     cluster = ray_start_cluster
     # Cluster total cpu resources is 4.
     cluster.add_node(
-        num_cpus=4, _system_config={
+        num_cpus=4,
+        _system_config={
             "debug_dump_period_milliseconds": 100,
-        })
+        },
+    )
     ray.init(address=cluster.address)
 
     # A slow function never returns. It will hold cpu resources all the way.
@@ -57,14 +58,10 @@ def test_worker_startup_count(ray_start_cluster):
 
     # Flood a large scale lease worker requests.
     for i in range(10000):
-        # Use random cpu resources to make sure that all tasks are sent
-        # to the raylet. Because core worker will cache tasks with the
-        # same resource shape.
-        num_cpus = 0.24 + np.random.uniform(0, 0.01)
-        slow_function.options(num_cpus=num_cpus).remote()
+        slow_function.options(num_cpus=0.25).remote()
 
     # Check "debug_state.txt" to ensure no extra workers were started.
-    session_dir = ray.worker.global_worker.node.address_info["session_dir"]
+    session_dir = ray._private.worker.global_worker.node.address_info["session_dir"]
     session_path = Path(session_dir)
     debug_state_path = session_path / "logs" / "debug_state.txt"
 
@@ -73,7 +70,7 @@ def test_worker_startup_count(ray_start_cluster):
             for line in f.readlines():
                 num_workers_prefix = "- num PYTHON workers: "
                 if num_workers_prefix in line:
-                    num_workers = int(line[len(num_workers_prefix):])
+                    num_workers = int(line[len(num_workers_prefix) :])
                     return num_workers
         return None
 
@@ -98,51 +95,51 @@ def test_worker_startup_count(ray_start_cluster):
         time.sleep(0.1)
 
 
-def test_function_unique_export(ray_start_regular):
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Fork is only supported on *nix systems.",
+)
+def test_fork_support(shutdown_only):
+    """Test that fork support works."""
+    ray.init(
+        _system_config={
+            "support_fork": True,
+        },
+    )
+
     @ray.remote
-    def f():
-        pass
+    def pool_factorial():
+        import math
+        import multiprocessing
+
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(processes=4) as pool:
+            return sum(pool.map(math.factorial, range(8)))
 
     @ray.remote
     def g():
-        ray.get(f.remote())
+        import threading
 
-    if gcs_pubsub_enabled():
-        subscriber = GcsFunctionKeySubscriber(
-            address=ray.worker.global_worker.gcs_client.address)
-        subscriber.subscribe()
+        assert threading.get_ident() == threading.main_thread().ident
+        # Make sure this is the only Python thread, because forking does not
+        # work well under multi-threading.
+        assert threading.active_count() == 1
 
-        ray.get(g.remote())
+        return ray.get(pool_factorial.remote())
 
-        # Poll pubsub channel for messages generated from running task g().
-        num_exports = 0
-        while True:
-            key = subscriber.poll(timeout=1)
-            if key is None:
-                break
-            else:
-                num_exports += 1
-        print(f"num_exports after running g(): {num_exports}")
-
-        ray.get([g.remote() for _ in range(5)])
-
-        key = subscriber.poll(timeout=1)
-        assert key is None, f"Unexpected function key export: {key}"
-    else:
-        ray.get(g.remote())
-        num_exports = ray.worker.global_worker.redis_client.llen("Exports")
-        ray.get([g.remote() for _ in range(5)])
-        assert ray.worker.global_worker.redis_client.llen("Exports") == \
-               num_exports
+    assert ray.get(g.remote()) == 5914
 
 
 @pytest.mark.skipif(
     sys.platform not in ["win32", "darwin"],
-    reason="Only listen on localhost by default on mac and windows.")
+    reason="Only listen on localhost by default on mac and windows.",
+)
+@mock.patch("ray._private.services.ray_constants.ENABLE_RAY_CLUSTER", False)
+@mock.patch.dict(os.environ, {"RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER": "0"})
 @pytest.mark.parametrize("start_ray", ["ray_start_regular", "call_ray_start"])
 def test_listen_on_localhost(start_ray, request):
     """All ray processes should listen on localhost by default
-       on mac and windows to prevent security popups.
+    on mac and windows to prevent security popups.
     """
     request.getfixturevalue(start_ray)
 
@@ -156,8 +153,9 @@ def test_listen_on_localhost(start_ray, request):
     for keyword, filter_by_cmd in RAY_PROCESSES:
         for candidate in process_infos:
             proc, proc_cmd, proc_cmdline = candidate
-            corpus = (proc_cmd if filter_by_cmd else
-                      subprocess.list2cmdline(proc_cmdline))
+            corpus = (
+                proc_cmd if filter_by_cmd else subprocess.list2cmdline(proc_cmdline)
+            )
             if keyword not in corpus:
                 continue
 
@@ -204,6 +202,7 @@ def test_job_id_consistency(ray_start_regular):
                     exc.append(e)
 
             import threading
+
             t = threading.Thread(target=run)
             t.start()
             t.join()
@@ -226,7 +225,8 @@ def test_fair_queueing(shutdown_only):
             # before we can execute the first h task.
             "max_pending_lease_requests_per_scheduling_category": 1,
             "worker_cap_enabled": True,
-        })
+        },
+    )
 
     @ray.remote
     def h():
@@ -244,9 +244,15 @@ def test_fair_queueing(shutdown_only):
     # https://github.com/ray-project/ray/issues/3644
     timeout = 60.0
     ready, _ = ray.wait(
-        [f.remote() for _ in range(1000)], timeout=timeout, num_returns=1000)
+        [f.remote() for _ in range(1000)], timeout=timeout, num_returns=1000
+    )
     assert len(ready) == 1000, len(ready)
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-v", __file__]))
+    import os
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

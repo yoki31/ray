@@ -5,6 +5,8 @@
 """
 from ray.rllib.utils.framework import try_import_tf
 from ray.rllib.utils.typing import TensorType
+from ray.rllib.utils.deprecation import deprecation_warning
+from ray.util import log_once
 
 tf1, tf, tfv = try_import_tf()
 
@@ -19,9 +21,15 @@ class MultiHeadAttention(tf.keras.layers.Layer if tf else object):
         self._num_heads = num_heads
         self._head_dim = head_dim
         self._qkv_layer = tf.keras.layers.Dense(
-            3 * num_heads * head_dim, use_bias=False)
+            3 * num_heads * head_dim, use_bias=False
+        )
         self._linear_layer = tf.keras.layers.TimeDistributed(
-            tf.keras.layers.Dense(out_dim, use_bias=False))
+            tf.keras.layers.Dense(out_dim, use_bias=False)
+        )
+        if log_once("multi_head_attention"):
+            deprecation_warning(
+                old="rllib.models.tf.layers.MultiHeadAttention",
+            )
 
     def call(self, inputs: TensorType) -> TensorType:
         L = tf.shape(inputs)[1]  # length of segment
@@ -44,7 +52,7 @@ class MultiHeadAttention(tf.keras.layers.Layer if tf else object):
         mask = tf.sequence_mask(tf.range(1, L + 1), dtype=score.dtype)
         mask = mask[None, :, :, None]
 
-        masked_score = score * mask + 1e30 * (mask - 1.)
+        masked_score = score * mask + 1e30 * (mask - 1.0)
         wmat = tf.nn.softmax(masked_score, axis=2)
 
         out = tf.einsum("bijh,bjhd->bihd", wmat, values)

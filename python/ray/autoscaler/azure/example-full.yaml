@@ -42,6 +42,19 @@ provider:
     resource_group: ray-cluster
     # set subscription id otherwise the default from az cli will be used
     # subscription_id: 00000000-0000-0000-0000-000000000000
+    # set unique subnet mask or a random mask will be used
+    # subnet_mask: 10.0.0.0/16
+    # set unique id for resources in this cluster
+    # if not set a default id will be generated based on the resource group and cluster name
+    # unique_id: RAY1
+    # set managed identity name and resource group
+    # if not set, a default user-assigned identity will be generated in the resource group specified above
+    # msi_name: ray-cluster-msi
+    # msi_resource_group: other-rg
+    # Set provisioning and use of public/private IPs for head and worker nodes. If both options below are true,
+    # only the head node will have a public IP address provisioned.
+    # use_internal_ips: True
+    # use_external_head_ip: True
 
 # How Ray will authenticate with newly launched nodes.
 auth:
@@ -148,7 +161,7 @@ setup_commands: []
     # below with a git checkout <your_sha> (and possibly a recompile).
     # To run the nightly version of ray (as opposed to the latest), either use a rayproject docker image
     # that has the "nightly" (e.g. "rayproject/ray-ml:nightly-gpu") or uncomment the following line:
-    # - pip install -U "ray[default] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-2.0.0.dev0-cp38-cp38-manylinux2014_x86_64.whl"
+    # - pip install -U "ray[default] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp38-cp38-manylinux2014_x86_64.whl"
 
 # Custom commands that will be run on the head node after common setup.
 # NOTE: rayproject/ray-ml:latest has azure packages bundled
@@ -167,6 +180,3 @@ head_start_ray_commands:
 worker_start_ray_commands:
     - ray stop
     - ray start --address=$RAY_HEAD_IP:6379 --object-manager-port=8076
-
-head_node: {}
-worker_nodes: {}

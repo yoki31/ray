@@ -1,6 +1,6 @@
 from typing import Optional
 
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.schedules.schedule import Schedule
 from ray.rllib.utils.typing import TensorType
@@ -8,6 +8,7 @@ from ray.rllib.utils.typing import TensorType
 torch, _ = try_import_torch()
 
 
+@OldAPIStack
 class ExponentialSchedule(Schedule):
     """Exponential decay schedule from `initial_p` to `final_p`.
 
@@ -15,11 +16,13 @@ class ExponentialSchedule(Schedule):
     always returns `final_p`.
     """
 
-    def __init__(self,
-                 schedule_timesteps: int,
-                 framework: Optional[str] = None,
-                 initial_p: float = 1.0,
-                 decay_rate: float = 0.1):
+    def __init__(
+        self,
+        schedule_timesteps: int,
+        framework: Optional[str] = None,
+        initial_p: float = 1.0,
+        decay_rate: float = 0.1,
+    ):
         """Initializes a ExponentialSchedule instance.
 
         Args:
@@ -41,9 +44,7 @@ class ExponentialSchedule(Schedule):
 
     @override(Schedule)
     def _value(self, t: TensorType) -> TensorType:
-        """Returns the result of: initial_p * decay_rate ** (`t`/t_max).
-        """
+        """Returns the result of: initial_p * decay_rate ** (`t`/t_max)."""
         if self.framework == "torch" and torch and isinstance(t, torch.Tensor):
             t = t.float()
-        return self.initial_p * \
-            self.decay_rate ** (t / self.schedule_timesteps)
+        return self.initial_p * self.decay_rate ** (t / self.schedule_timesteps)

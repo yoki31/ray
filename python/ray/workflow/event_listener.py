@@ -7,7 +7,7 @@ from typing import Callable
 EventListenerType = Callable[[], "EventListener"]
 
 
-@PublicAPI(stability="beta")
+@PublicAPI(stability="alpha")
 class EventListener:
     """Defining a custom event listener. Event listeners provide an efficient way
     to listen for a custom event.
@@ -33,16 +33,21 @@ class EventListener:
 
     Example Usage
     =============
+    .. testcode::
+        :skipif: True
 
-    >>> event_step = \
-        workflow.wait_for_event(CustomProvider, "topic1", "partition2")
-    >>> handle_event.step(event_step).run()
+        from ray import workflow
+        CustomEventListener = ...
+        event_task = workflow.wait_for_event(
+            CustomEventListener, "topic1", "partition2")
+        handle_event = ...
+        workflow.run(handle_event.task(event_task))
 
     """
 
     def __init__(self):
         """Optional constructor. Only the constructor with now arguments will be
-           called."""
+        called."""
         pass
 
     async def poll_for_event(self, *args, **kwargs) -> Event:
@@ -51,11 +56,11 @@ class EventListener:
 
     async def event_checkpointed(self, event: Event) -> None:
         """Optional. Called after an event has been checkpointed and a transaction can
-           be safely committed."""
+        be safely committed."""
         pass
 
 
-@PublicAPI(stability="beta")
+@PublicAPI(stability="alpha")
 class TimerListener(EventListener):
     """
     A listener that produces an event at a given timestamp.

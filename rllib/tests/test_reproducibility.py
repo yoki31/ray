@@ -1,9 +1,14 @@
-import gym
+import gymnasium as gym
 import numpy as np
 import unittest
 
 import ray
-from ray.rllib.agents.dqn import DQNTrainer
+from ray.rllib.algorithms.dqn import DQNConfig
+from ray.rllib.utils.metrics import (
+    EPISODE_RETURN_MAX,
+    EPISODE_RETURN_MIN,
+    ENV_RUNNER_RESULTS,
+)
 from ray.rllib.utils.test_utils import framework_iterator
 from ray.tune.registry import register_env
 
@@ -13,16 +18,17 @@ class TestReproducibility(unittest.TestCase):
         class PickLargest(gym.Env):
             def __init__(self):
                 self.observation_space = gym.spaces.Box(
-                    low=float("-inf"), high=float("inf"), shape=(4, ))
+                    low=float("-inf"), high=float("inf"), shape=(4,)
+                )
                 self.action_space = gym.spaces.Discrete(4)
 
-            def reset(self, **kwargs):
+            def reset(self, *, seed=None, options=None):
                 self.obs = np.random.randn(4)
-                return self.obs
+                return self.obs, {}
 
             def step(self, action):
                 reward = self.obs[action]
-                return self.obs, reward, True, {}
+                return self.obs, reward, True, False, {}
 
         def env_creator(env_config):
             return PickLargest()
@@ -32,21 +38,26 @@ class TestReproducibility(unittest.TestCase):
             for trial in range(3):
                 ray.init()
                 register_env("PickLargest", env_creator)
-                config = {
-                    "seed": 666 if trial in [0, 1] else 999,
-                    "min_iter_time_s": 0,
-                    "timesteps_per_iteration": 100,
-                    "framework": fw,
-                }
-                agent = DQNTrainer(config=config, env="PickLargest")
+                config = (
+                    DQNConfig()
+                    .environment("PickLargest")
+                    .debugging(seed=666 if trial in [0, 1] else 999)
+                    .reporting(
+                        min_time_s_per_iteration=0,
+                        min_sample_timesteps_per_iteration=100,
+                    )
+                    .framework(fw)
+                )
+                algo = config.build()
 
                 trajectory = list()
                 for _ in range(8):
-                    r = agent.train()
-                    trajectory.append(r["episode_reward_max"])
-                    trajectory.append(r["episode_reward_min"])
+                    r = algo.train()
+                    trajectory.append(r[ENV_RUNNER_RESULTS][EPISODE_RETURN_MAX])
+                    trajectory.append(r[ENV_RUNNER_RESULTS][EPISODE_RETURN_MIN])
                 trajs.append(trajectory)
 
+                algo.stop()
                 ray.shutdown()
 
             # trial0 and trial1 use same seed and thus
@@ -69,4 +80,5 @@ class TestReproducibility(unittest.TestCase):
 if __name__ == "__main__":
     import pytest
     import sys
+
     sys.exit(pytest.main(["-v", __file__]))

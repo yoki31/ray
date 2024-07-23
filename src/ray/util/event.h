@@ -25,6 +25,7 @@
 #include <sstream>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "nlohmann/json.hpp"
 #include "ray/util/logging.h"
 #include "ray/util/util.h"
@@ -37,6 +38,34 @@ using json = nlohmann::json;
 
 namespace ray {
 
+// RAY_EVENT_EVERY_N/RAY_EVENT_EVERY_MS, adaped from
+// https://github.com/google/glog/blob/master/src/glog/logging.h.in
+#define RAY_EVENT_EVERY_N_VARNAME(base, line) RAY_EVENT_EVERY_N_VARNAME_CONCAT(base, line)
+#define RAY_EVENT_EVERY_N_VARNAME_CONCAT(base, line) base##line
+
+/// Macros for RAY_EVENT_EVERY_MS
+#define RAY_EVENT_TIME_PERIOD RAY_EVENT_EVERY_N_VARNAME(timePeriod_, __LINE__)
+#define RAY_EVENT_PREVIOUS_TIME_RAW RAY_EVENT_EVERY_N_VARNAME(previousTimeRaw_, __LINE__)
+#define RAY_EVENT_TIME_DELTA RAY_EVENT_EVERY_N_VARNAME(deltaTime_, __LINE__)
+#define RAY_EVENT_CURRENT_TIME RAY_EVENT_EVERY_N_VARNAME(currentTime_, __LINE__)
+#define RAY_EVENT_PREVIOUS_TIME RAY_EVENT_EVERY_N_VARNAME(previousTime_, __LINE__)
+
+#define RAY_EVENT_EVERY_MS(event_type, label, ms)                                     \
+  constexpr std::chrono::milliseconds RAY_EVENT_TIME_PERIOD(ms);                      \
+  static std::atomic<int64_t> RAY_EVENT_PREVIOUS_TIME_RAW;                            \
+  const auto RAY_EVENT_CURRENT_TIME =                                                 \
+      std::chrono::steady_clock::now().time_since_epoch();                            \
+  const decltype(RAY_EVENT_CURRENT_TIME) RAY_EVENT_PREVIOUS_TIME(                     \
+      RAY_EVENT_PREVIOUS_TIME_RAW.load(std::memory_order_relaxed));                   \
+  const auto RAY_EVENT_TIME_DELTA = RAY_EVENT_CURRENT_TIME - RAY_EVENT_PREVIOUS_TIME; \
+  if (RAY_EVENT_TIME_DELTA > RAY_EVENT_TIME_PERIOD)                                   \
+    RAY_EVENT_PREVIOUS_TIME_RAW.store(RAY_EVENT_CURRENT_TIME.count(),                 \
+                                      std::memory_order_relaxed);                     \
+  if (ray::RayEvent::IsLevelEnabled(                                                  \
+          ::ray::rpc::Event_Severity::Event_Severity_##event_type) &&                 \
+      RAY_EVENT_TIME_DELTA > RAY_EVENT_TIME_PERIOD)                                   \
+  RAY_EVENT(event_type, label)
+
 #define RAY_EVENT(event_type, label)                                            \
   if (ray::RayEvent::IsLevelEnabled(                                            \
           ::ray::rpc::Event_Severity::Event_Severity_##event_type) ||           \
@@ -45,7 +74,9 @@ namespace ray {
   ::ray::RayEvent(::ray::rpc::Event_Severity::Event_Severity_##event_type,      \
                   ray::RayEvent::EventLevelToLogLevel(                          \
                       ::ray::rpc::Event_Severity::Event_Severity_##event_type), \
-                  label, __FILE__, __LINE__)
+                  label,                                                        \
+                  __FILE__,                                                     \
+                  __LINE__)
 
 // interface of event reporter
 class BaseEventReporter {
@@ -61,8 +92,10 @@ class BaseEventReporter {
 // responsible for writing event to specific file
 class LogEventReporter : public BaseEventReporter {
  public:
-  LogEventReporter(rpc::Event_SourceType source_type, const std::string &log_dir,
-                   bool force_flush = true, int rotate_max_file_size = 100,
+  LogEventReporter(rpc::Event_SourceType source_type,
+                   const std::string &log_dir,
+                   bool force_flush = true,
+                   int rotate_max_file_size = 100,
                    int rotate_max_file_num = 20);
 
   virtual ~LogEventReporter();
@@ -122,7 +155,7 @@ class EventManager final {
   const EventManager &operator=(const EventManager &manager) = delete;
 
  private:
-  std::unordered_map<std::string, std::shared_ptr<BaseEventReporter>> reporter_map_;
+  absl::flat_hash_map<std::string, std::shared_ptr<BaseEventReporter>> reporter_map_;
 };
 
 // store the event context. Different workers of a process in core_worker have different
@@ -133,13 +166,21 @@ class RayEventContext final {
 
   RayEventContext() {}
 
-  void SetEventContext(rpc::Event_SourceType source_type,
-                       const std::unordered_map<std::string, std::string> &custom_fields =
-                           std::unordered_map<std::string, std::string>());
+  void SetEventContext(
+      rpc::Event_SourceType source_type,
+      const absl::flat_hash_map<std::string, std::string> &custom_fields =
+          absl::flat_hash_map<std::string, std::string>());
 
-  void SetCustomField(const std::string &key, const std::string &value);
+  // Only for test, isn't thread-safe with SetEventContext.
+  void ResetEventContext();
 
-  void SetCustomFields(const std::unordered_map<std::string, std::string> &custom_fields);
+  // If the key already exists, replace the value. Otherwise, insert a new item.
+  void UpdateCustomField(const std::string &key, const std::string &value);
+
+  // Update the `custom_fields` into the existing items.
+  // If the key already exists, replace the value. Otherwise, insert a new item.
+  void UpdateCustomFields(
+      const absl::flat_hash_map<std::string, std::string> &custom_fields);
 
   inline void SetSourceType(rpc::Event_SourceType source_type) {
     source_type_ = source_type;
@@ -151,7 +192,7 @@ class RayEventContext final {
 
   inline int32_t GetSourcePid() const { return source_pid_; }
 
-  inline const std::unordered_map<std::string, std::string> &GetCustomFields() const {
+  inline const absl::flat_hash_map<std::string, std::string> &GetCustomFields() const {
     return custom_fields_;
   }
 
@@ -166,15 +207,10 @@ class RayEventContext final {
 
   const RayEventContext &operator=(const RayEventContext &event_context) = delete;
 
-  // Only for test, isn't thread-safe with SetEventContext.
-  void ResetEventContext();
-
-  FRIEND_TEST(EVENT_TEST, MULTI_THREAD_CONTEXT_COPY);
-
   rpc::Event_SourceType source_type_ = rpc::Event_SourceType::Event_SourceType_COMMON;
   std::string source_hostname_ = boost::asio::ip::host_name();
   int32_t source_pid_ = getpid();
-  std::unordered_map<std::string, std::string> custom_fields_;
+  absl::flat_hash_map<std::string, std::string> custom_fields_;
 
   static thread_local std::unique_ptr<RayEventContext> context_;
 
@@ -194,8 +230,11 @@ class RayEvent {
  public:
   // We require file_name to be a string which has static storage before RayEvent
   // deconstructed. Otherwise we might have memory issues.
-  RayEvent(rpc::Event_Severity severity, RayLogLevel log_severity,
-           const std::string &label, const char *file_name, int line_number)
+  RayEvent(rpc::Event_Severity severity,
+           RayLogLevel log_severity,
+           const std::string &label,
+           const char *file_name,
+           int line_number)
       : severity_(severity),
         log_severity_(log_severity),
         label_(label),
@@ -217,8 +256,10 @@ class RayEvent {
     return *this;
   }
 
-  static void ReportEvent(const std::string &severity, const std::string &label,
-                          const std::string &message, const char *file_name,
+  static void ReportEvent(const std::string &severity,
+                          const std::string &label,
+                          const std::string &message,
+                          const char *file_name,
                           int line_number);
 
   /// Return whether or not the event level is enabled in current setting.
@@ -226,6 +267,11 @@ class RayEvent {
   /// \param event_level The input event level.
   /// \return True if input event level is not lower than the threshold.
   static bool IsLevelEnabled(rpc::Event_Severity event_level);
+
+  /// Return whether or not the event should be logged to a log file.
+  ///
+  /// \return True if event should be logged.
+  static bool EmitToLogFile();
 
   static RayLogLevel EventLevelToLogLevel(const rpc::Event_Severity &severity);
 
@@ -242,10 +288,12 @@ class RayEvent {
 
   // Only for test
   static void SetLevel(const std::string &event_level);
+  // Only for test
+  static void SetEmitToLogFile(bool emit_to_log_file);
 
-  FRIEND_TEST(EVENT_TEST, TEST_LOG_LEVEL);
+  FRIEND_TEST(EventTest, TestLogLevel);
 
-  FRIEND_TEST(EVENT_TEST, TEST_LOG_EVENT);
+  FRIEND_TEST(EventTest, TestLogEvent);
 
  private:
   rpc::Event_Severity severity_;
@@ -266,9 +314,13 @@ class RayEvent {
 /// \param log_dir The log directory to generate event subdirectory.
 /// \param event_level The input event level. It should be one of "info","warning",
 /// "error" and "fatal". You can also use capital letters for the options above.
+/// \param emit_event_to_log_file if True, it will emit the event to the process log file
+/// (e.g., gcs_server.out). Otherwise, event will only be recorded to the event log file.
 /// \return void.
 void RayEventInit(rpc::Event_SourceType source_type,
-                  const std::unordered_map<std::string, std::string> &custom_fields,
-                  const std::string &log_dir, const std::string &event_level = "warning");
+                  const absl::flat_hash_map<std::string, std::string> &custom_fields,
+                  const std::string &log_dir,
+                  const std::string &event_level = "warning",
+                  bool emit_event_to_log_file = false);
 
 }  // namespace ray

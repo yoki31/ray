@@ -17,14 +17,16 @@
 #include <memory>
 
 #include "absl/memory/memory.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "gtest/gtest_prod.h"
 #include "ray/common/client_connection.h"
 #include "ray/common/id.h"
-#include "ray/common/task/scheduling_resources.h"
+#include "ray/common/scheduling/resource_set.h"
+#include "ray/common/scheduling/scheduling_ids.h"
 #include "ray/common/task/task.h"
 #include "ray/common/task/task_common.h"
 #include "ray/raylet/scheduling/cluster_resource_scheduler.h"
-#include "ray/raylet/scheduling/scheduling_ids.h"
 #include "ray/rpc/worker/core_worker_client.h"
 #include "ray/util/process.h"
 
@@ -52,11 +54,9 @@ class WorkerInterface {
   /// Return the worker process's startup token
   virtual StartupToken GetStartupToken() const = 0;
   virtual void SetProcess(Process proc) = 0;
-  /// Return the worker shim process.
-  virtual Process GetShimProcess() const = 0;
-  virtual void SetShimProcess(Process proc) = 0;
   virtual Language GetLanguage() const = 0;
   virtual const std::string IpAddress() const = 0;
+  virtual void AsyncNotifyGCSRestart() = 0;
   /// Connect this worker's gRPC client.
   virtual void Connect(int port) = 0;
   /// Testing-only
@@ -66,13 +66,11 @@ class WorkerInterface {
   virtual void SetAssignedPort(int port) = 0;
   virtual void AssignTaskId(const TaskID &task_id) = 0;
   virtual const TaskID &GetAssignedTaskId() const = 0;
-  virtual bool AddBlockedTaskId(const TaskID &task_id) = 0;
-  virtual bool RemoveBlockedTaskId(const TaskID &task_id) = 0;
-  virtual const std::unordered_set<TaskID> &GetBlockedTaskIds() const = 0;
   virtual const JobID &GetAssignedJobId() const = 0;
   virtual int GetRuntimeEnvHash() const = 0;
   virtual void AssignActorId(const ActorID &actor_id) = 0;
   virtual const ActorID &GetActorId() const = 0;
+  virtual const std::string GetTaskOrActorIdAsDebugString() const = 0;
   virtual void MarkDetachedActor() = 0;
   virtual bool IsDetachedActor() const = 0;
   virtual const std::shared_ptr<ClientConnection> Connection() const = 0;
@@ -109,14 +107,27 @@ class WorkerInterface {
   /// Return True if the worker is available for scheduling a task or actor.
   virtual bool IsAvailableForScheduling() const = 0;
 
+  /// Time when the last task was assigned to this worker.
+  virtual absl::Time GetAssignedTaskTime() const = 0;
+
+  virtual void SetJobId(const JobID &job_id) = 0;
+
+  virtual const ActorID &GetRootDetachedActorId() const = 0;
+
  protected:
   virtual void SetStartupToken(StartupToken startup_token) = 0;
 
-  FRIEND_TEST(WorkerPoolTest, PopWorkerMultiTenancy);
-  FRIEND_TEST(WorkerPoolTest, TestWorkerCapping);
-  FRIEND_TEST(WorkerPoolTest, TestWorkerCappingLaterNWorkersNotOwningObjects);
-  FRIEND_TEST(WorkerPoolTest, TestWorkerCappingWithExitDelay);
-  FRIEND_TEST(WorkerPoolTest, MaximumStartupConcurrency);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest, PopWorkerMultiTenancy);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest, TestWorkerCapping);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest,
+              TestWorkerCappingLaterNWorkersNotOwningObjects);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest, TestJobFinishedForceKillIdleWorker);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest, TestJobFinishedForPopWorker);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest,
+              WorkerFromAliveJobDoesNotBlockWorkerFromDeadJobFromGettingKilled);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest, TestWorkerCappingWithExitDelay);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest, MaximumStartupConcurrency);
+  FRIEND_TEST(WorkerPoolDriverRegisteredTest, HandleWorkerRegistration);
 };
 
 /// Worker class encapsulates the implementation details of a worker. A worker
@@ -126,10 +137,15 @@ class Worker : public WorkerInterface {
  public:
   /// A constructor that initializes a worker object.
   /// NOTE: You MUST manually set the worker process.
-  Worker(const JobID &job_id, const int runtime_env_hash, const WorkerID &worker_id,
-         const Language &language, rpc::WorkerType worker_type,
-         const std::string &ip_address, std::shared_ptr<ClientConnection> connection,
-         rpc::ClientCallManager &client_call_manager, StartupToken startup_token);
+  Worker(const JobID &job_id,
+         const int runtime_env_hash,
+         const WorkerID &worker_id,
+         const Language &language,
+         rpc::WorkerType worker_type,
+         const std::string &ip_address,
+         std::shared_ptr<ClientConnection> connection,
+         rpc::ClientCallManager &client_call_manager,
+         StartupToken startup_token);
   /// A destructor responsible for freeing all worker state.
   ~Worker() {}
   rpc::WorkerType GetWorkerType() const;
@@ -145,11 +161,9 @@ class Worker : public WorkerInterface {
   /// Return the worker process's startup token
   StartupToken GetStartupToken() const;
   void SetProcess(Process proc);
-  /// Return this worker shim process.
-  Process GetShimProcess() const;
-  void SetShimProcess(Process proc);
   Language GetLanguage() const;
   const std::string IpAddress() const;
+  void AsyncNotifyGCSRestart();
   /// Connect this worker's gRPC client.
   void Connect(int port);
   /// Testing-only
@@ -159,13 +173,13 @@ class Worker : public WorkerInterface {
   void SetAssignedPort(int port);
   void AssignTaskId(const TaskID &task_id);
   const TaskID &GetAssignedTaskId() const;
-  bool AddBlockedTaskId(const TaskID &task_id);
-  bool RemoveBlockedTaskId(const TaskID &task_id);
-  const std::unordered_set<TaskID> &GetBlockedTaskIds() const;
   const JobID &GetAssignedJobId() const;
   int GetRuntimeEnvHash() const;
   void AssignActorId(const ActorID &actor_id);
   const ActorID &GetActorId() const;
+  // Creates the debug string for the ID of the task or actor depending on which is
+  // running.
+  const std::string GetTaskOrActorIdAsDebugString() const;
   void MarkDetachedActor();
   bool IsDetachedActor() const;
   const std::shared_ptr<ClientConnection> Connection() const;
@@ -194,6 +208,8 @@ class Worker : public WorkerInterface {
     lifetime_allocated_instances_ = allocated_instances;
   };
 
+  const ActorID &GetRootDetachedActorId() const { return root_detached_actor_id_; }
+
   std::shared_ptr<TaskResourceInstances> GetLifetimeAllocatedInstances() {
     return lifetime_allocated_instances_;
   };
@@ -202,7 +218,13 @@ class Worker : public WorkerInterface {
 
   RayTask &GetAssignedTask() { return assigned_task_; };
 
-  void SetAssignedTask(const RayTask &assigned_task) { assigned_task_ = assigned_task; };
+  void SetAssignedTask(const RayTask &assigned_task) {
+    assigned_task_ = assigned_task;
+    task_assign_time_ = absl::Now();
+    root_detached_actor_id_ = assigned_task.GetTaskSpecification().RootDetachedActorId();
+  }
+
+  absl::Time GetAssignedTaskTime() const { return task_assign_time_; };
 
   bool IsRegistered() { return rpc_client_ != nullptr; }
 
@@ -218,6 +240,8 @@ class Worker : public WorkerInterface {
     return rpc_client_.get();
   }
 
+  void SetJobId(const JobID &job_id);
+
  protected:
   void SetStartupToken(StartupToken startup_token);
 
@@ -228,9 +252,6 @@ class Worker : public WorkerInterface {
   Process proc_;
   /// The worker's process's startup_token
   StartupToken startup_token_;
-  /// The worker's shim process. The shim process PID is the same with worker process PID,
-  /// except starting worker process in container.
-  Process shim_proc_;
   /// The language type of this worker.
   Language language_;
   /// The type of the worker.
@@ -249,13 +270,15 @@ class Worker : public WorkerInterface {
   /// The worker's currently assigned task.
   TaskID assigned_task_id_;
   /// Job ID for the worker's current assigned task.
-  const JobID assigned_job_id_;
+  JobID assigned_job_id_;
   /// The hash of the worker's assigned runtime env.  We use this in the worker
   /// pool to cache and reuse workers with the same runtime env, because
   /// installing runtime envs from scratch can be slow.
   const int runtime_env_hash_;
   /// The worker's actor ID. If this is nil, then the worker is not an actor.
   ActorID actor_id_;
+  /// Root detached actor ID for the worker's last assigned task.
+  ActorID root_detached_actor_id_;
   /// The worker's placement group bundle. It is used to detect if the worker is
   /// associated with a placement group bundle.
   BundleID bundle_id_;
@@ -264,7 +287,6 @@ class Worker : public WorkerInterface {
   /// Whether the worker is blocked. Workers become blocked in a `ray.get`, if
   /// they require a data dependency while executing a task.
   bool blocked_;
-  std::unordered_set<TaskID> blocked_task_ids_;
   /// The `ClientCallManager` object that is shared by `CoreWorkerClient` from all
   /// workers.
   rpc::ClientCallManager &client_call_manager_;
@@ -284,6 +306,10 @@ class Worker : public WorkerInterface {
   std::shared_ptr<TaskResourceInstances> lifetime_allocated_instances_;
   /// RayTask being assigned to this worker.
   RayTask assigned_task_;
+  /// Time when the last task was assigned to this worker.
+  absl::Time task_assign_time_;
+  /// If true, a RPC need to be sent to notify the worker about GCS restarting.
+  bool notify_gcs_restarted_ = false;
 };
 
 }  // namespace raylet

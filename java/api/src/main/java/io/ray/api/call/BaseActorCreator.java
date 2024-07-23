@@ -25,6 +25,19 @@ public class BaseActorCreator<T extends BaseActorCreator> {
     return self();
   }
 
+  /**
+   * Set the actor name along with a different namespace.
+   *
+   * @param name The name of the named actor.
+   * @param namespace The namespace that this actor will live in.
+   * @return self
+   */
+  public T setName(String name, String namespace) {
+    builder.setName(name);
+    builder.setNamespace(namespace);
+    return self();
+  }
+
   public T setLifetime(ActorLifetime lifetime) {
     builder.setLifetime(lifetime);
     return self();
@@ -74,6 +87,20 @@ public class BaseActorCreator<T extends BaseActorCreator> {
   }
 
   /**
+   * This specifies the maximum number of times that an actor task can be retried. The minimum valid
+   * value is 0 (default), which indicates that the actor task can't be retried. A value of -1
+   * indicates that an actor task can be retried indefinitely.
+   *
+   * @param maxTaskRetries max number of actor task retries
+   * @return self
+   * @see ActorCreationOptions.Builder#setMaxTaskRetries(int)
+   */
+  public T setMaxTaskRetries(int maxTaskRetries) {
+    builder.setMaxTaskRetries(maxTaskRetries);
+    return self();
+  }
+
+  /**
    * Set the max number of concurrent calls to allow for this actor.
    *
    * <p>The maximum concurrency defaults to 1 for threaded execution. Note that the execution order
@@ -112,6 +139,17 @@ public class BaseActorCreator<T extends BaseActorCreator> {
   public T setPlacementGroup(PlacementGroup group, int bundleIndex) {
     builder.setPlacementGroup(group, bundleIndex);
     return self();
+  }
+
+  /**
+   * Set the placement group to place this actor in, which may use any available bundle.
+   *
+   * @param group The placement group of the actor.
+   * @return self
+   * @see ActorCreationOptions.Builder#setPlacementGroup(PlacementGroup, int)
+   */
+  public T setPlacementGroup(PlacementGroup group) {
+    return setPlacementGroup(group, -1);
   }
 
   @SuppressWarnings("unchecked")

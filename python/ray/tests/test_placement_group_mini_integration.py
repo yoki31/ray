@@ -4,15 +4,11 @@ import time
 
 from random import random
 
-try:
-    import pytest_timeout
-except ImportError:
-    pytest_timeout = None
-
 import ray
 import ray.cluster_utils
 from ray._private.test_utils import wait_for_condition
-from ray.util.placement_group import (placement_group, remove_placement_group)
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 def run_mini_integration_test(cluster, pg_removal=True, num_pgs=999):
@@ -33,9 +29,9 @@ def run_mini_integration_test(cluster, pg_removal=True, num_pgs=999):
     for _ in range(num_nodes):
         nodes.append(
             cluster.add_node(
-                num_cpus=3,
-                num_gpus=resource_quantity,
-                resources=custom_resources))
+                num_cpus=3, num_gpus=resource_quantity, resources=custom_resources
+            )
+        )
     cluster.wait_for_nodes()
     num_nodes = len(nodes)
 
@@ -62,7 +58,7 @@ def run_mini_integration_test(cluster, pg_removal=True, num_pgs=999):
         if pg_removal:
             print("removing pgs")
         for pg in pgs:
-            if random() < .5 and pg_removal:
+            if random() < 0.5 and pg_removal:
                 pgs_removed.append(pg)
             else:
                 pgs_unremoved.append(pg)
@@ -75,8 +71,11 @@ def run_mini_integration_test(cluster, pg_removal=True, num_pgs=999):
             for i in range(num_nodes):
                 tasks.append(
                     mock_task.options(
-                        placement_group=pg,
-                        placement_group_bundle_index=i).remote())
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=pg, placement_group_bundle_index=i
+                        )
+                    ).remote()
+                )
         # Remove the rest of placement groups.
         if pg_removal:
             for pg in pgs_removed:
@@ -100,8 +99,7 @@ def run_mini_integration_test(cluster, pg_removal=True, num_pgs=999):
 
     def wait_for_resource_recovered():
         for resource, val in ray.available_resources().items():
-            if (resource in cluster_resources
-                    and cluster_resources[resource] != val):
+            if resource in cluster_resources and cluster_resources[resource] != val:
                 return False
             if "_group_" in resource:
                 return False
@@ -123,10 +121,15 @@ def test_placement_group_create_only(ray_start_cluster, execution_number):
 @pytest.mark.parametrize("execution_number", range(3))
 def test_placement_group_remove_stress(ray_start_cluster, execution_number):
     """Full PG mini integration test that runs many
-        concurrent remove_placement_group
+    concurrent remove_placement_group
     """
     run_mini_integration_test(ray_start_cluster, pg_removal=True, num_pgs=999)
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-sv", __file__]))
+    import os
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

@@ -1,3 +1,11 @@
+# @OldAPIStack
+
+# ***********************************************************************************
+# IMPORTANT NOTE: This script uses the old API stack and will soon be replaced by
+# `ray.rllib.examples.multi_agent.pettingzoo_shared_value_function.py`!
+# ***********************************************************************************
+
+
 """An example of implementing a centralized critic with ObservationFunction.
 
 The advantage of this approach is that it's very simple and you don't have to
@@ -10,63 +18,75 @@ modifies the policy to add a centralized value function.
 """
 
 import numpy as np
-from gym.spaces import Dict, Discrete
+from gymnasium.spaces import Dict, Discrete
 import argparse
 import os
 
-from ray import tune
-from ray.rllib.agents.callbacks import DefaultCallbacks
-from ray.rllib.examples.models.centralized_critic_models import \
-    YetAnotherCentralizedCriticModel, YetAnotherTorchCentralizedCriticModel
-from ray.rllib.examples.env.two_step_game import TwoStepGame
+from ray import air, tune
+from ray.air.constants import TRAINING_ITERATION
+from ray.rllib.algorithms.callbacks import DefaultCallbacks
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.examples._old_api_stack.models.centralized_critic_models import (
+    YetAnotherCentralizedCriticModel,
+    YetAnotherTorchCentralizedCriticModel,
+)
+from ray.rllib.examples.envs.classes.two_step_game import TwoStepGame
 from ray.rllib.models import ModelCatalog
 from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.utils.metrics import (
+    ENV_RUNNER_RESULTS,
+    EPISODE_RETURN_MEAN,
+    NUM_ENV_STEPS_SAMPLED_LIFETIME,
+)
 from ray.rllib.utils.test_utils import check_learning_achieved
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--framework",
-    choices=["tf", "tf2", "tfe", "torch"],
-    default="tf",
-    help="The DL framework specifier.")
+    choices=["tf", "tf2", "torch"],
+    default="torch",
+    help="The DL framework specifier.",
+)
 parser.add_argument(
     "--as-test",
     action="store_true",
     help="Whether this script should be run as a test: --stop-reward must "
-    "be achieved within --stop-timesteps AND --stop-iters.")
+    "be achieved within --stop-timesteps AND --stop-iters.",
+)
 parser.add_argument(
-    "--stop-iters",
-    type=int,
-    default=100,
-    help="Number of iterations to train.")
+    "--stop-iters", type=int, default=100, help="Number of iterations to train."
+)
 parser.add_argument(
-    "--stop-timesteps",
-    type=int,
-    default=100000,
-    help="Number of timesteps to train.")
+    "--stop-timesteps", type=int, default=100000, help="Number of timesteps to train."
+)
 parser.add_argument(
-    "--stop-reward",
-    type=float,
-    default=7.99,
-    help="Reward at which we stop training.")
+    "--stop-reward", type=float, default=7.99, help="Reward at which we stop training."
+)
 
 
 class FillInActions(DefaultCallbacks):
     """Fills in the opponent actions info in the training batches."""
 
-    def on_postprocess_trajectory(self, worker, episode, agent_id, policy_id,
-                                  policies, postprocessed_batch,
-                                  original_batches, **kwargs):
+    def on_postprocess_trajectory(
+        self,
+        worker,
+        episode,
+        agent_id,
+        policy_id,
+        policies,
+        postprocessed_batch,
+        original_batches,
+        **kwargs,
+    ):
         to_update = postprocessed_batch[SampleBatch.CUR_OBS]
         other_id = 1 if agent_id == 0 else 0
         action_encoder = ModelCatalog.get_preprocessor_for_space(Discrete(2))
 
         # set the opponent actions into the observation
         _, opponent_batch = original_batches[other_id]
-        opponent_actions = np.array([
-            action_encoder.transform(a)
-            for a in opponent_batch[SampleBatch.ACTIONS]
-        ])
+        opponent_actions = np.array(
+            [action_encoder.transform(a) for a in opponent_batch[SampleBatch.ACTIONS]]
+        )
         to_update[:, -2:] = opponent_actions
 
 
@@ -92,47 +112,61 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ModelCatalog.register_custom_model(
-        "cc_model", YetAnotherTorchCentralizedCriticModel
-        if args.framework == "torch" else YetAnotherCentralizedCriticModel)
+        "cc_model",
+        YetAnotherTorchCentralizedCriticModel
+        if args.framework == "torch"
+        else YetAnotherCentralizedCriticModel,
+    )
 
     action_space = Discrete(2)
-    observer_space = Dict({
-        "own_obs": Discrete(6),
-        # These two fields are filled in by the CentralCriticObserver, and are
-        # not used for inference, only for training.
-        "opponent_obs": Discrete(6),
-        "opponent_action": Discrete(2),
-    })
+    observer_space = Dict(
+        {
+            "own_obs": Discrete(6),
+            # These two fields are filled in by the CentralCriticObserver, and are
+            # not used for inference, only for training.
+            "opponent_obs": Discrete(6),
+            "opponent_action": Discrete(2),
+        }
+    )
 
-    config = {
-        "env": TwoStepGame,
-        "batch_mode": "complete_episodes",
-        "callbacks": FillInActions,
-        # Use GPUs iff `RLLIB_NUM_GPUS` env var set to > 0.
-        "num_gpus": int(os.environ.get("RLLIB_NUM_GPUS", "0")),
-        "num_workers": 0,
-        "multiagent": {
-            "policies": {
+    config = (
+        PPOConfig()
+        .environment(TwoStepGame)
+        .framework(args.framework)
+        .env_runners(
+            batch_mode="complete_episodes",
+            num_env_runners=0,
+            # TODO(avnishn) make a new example compatible w connectors.
+            enable_connectors=False,
+        )
+        .callbacks(FillInActions)
+        .training(model={"custom_model": "cc_model"})
+        .multi_agent(
+            policies={
                 "pol1": (None, observer_space, action_space, {}),
                 "pol2": (None, observer_space, action_space, {}),
             },
-            "policy_mapping_fn": (
-                lambda aid, **kwargs: "pol1" if aid == 0 else "pol2"),
-            "observation_fn": central_critic_observer,
-        },
-        "model": {
-            "custom_model": "cc_model",
-        },
-        "framework": args.framework,
-    }
+            policy_mapping_fn=lambda agent_id, episode, worker, **kwargs: "pol1"
+            if agent_id == 0
+            else "pol2",
+            observation_fn=central_critic_observer,
+        )
+        # Use GPUs iff `RLLIB_NUM_GPUS` env var set to > 0.
+        .resources(num_gpus=int(os.environ.get("RLLIB_NUM_GPUS", "0")))
+    )
 
     stop = {
-        "training_iteration": args.stop_iters,
-        "timesteps_total": args.stop_timesteps,
-        "episode_reward_mean": args.stop_reward,
+        TRAINING_ITERATION: args.stop_iters,
+        NUM_ENV_STEPS_SAMPLED_LIFETIME: args.stop_timesteps,
+        f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": args.stop_reward,
     }
 
-    results = tune.run("PPO", config=config, stop=stop, verbose=1)
+    tuner = tune.Tuner(
+        "PPO",
+        param_space=config.to_dict(),
+        run_config=air.RunConfig(stop=stop, verbose=1),
+    )
+    results = tuner.fit()
 
     if args.as_test:
         check_learning_achieved(results, args.stop_reward)

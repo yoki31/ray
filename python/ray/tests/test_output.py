@@ -1,24 +1,192 @@
-import subprocess
-import sys
-import pytest
+import os
 import re
 import signal
+import subprocess
+import sys
 import time
-import os
+
+import pytest
 
 import ray
+from ray._private.test_utils import (
+    run_string_as_driver,
+    run_string_as_driver_nonblocking,
+    run_string_as_driver_stdout_stderr,
+)
+from ray.autoscaler.v2.utils import is_autoscaler_v2
 
-from ray._private.test_utils import (run_string_as_driver_nonblocking,
-                                     run_string_as_driver)
 
-
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
-def test_autoscaler_infeasible():
+def test_dedup_logs():
     script = """
 import ray
 import time
 
+@ray.remote
+def verbose():
+    print(f"hello world, id={time.time()}")
+    time.sleep(1)
+
+ray.init(num_cpus=4)
+ray.get([verbose.remote() for _ in range(10)])
+"""
+
+    proc = run_string_as_driver_nonblocking(script)
+    out_str = proc.stdout.read().decode("ascii")
+
+    assert out_str.count("hello") == 2
+    assert out_str.count("RAY_DEDUP_LOGS") == 1
+    assert out_str.count("[repeated 9x across cluster]") == 1
+
+
+def test_dedup_error_warning_logs(ray_start_cluster, monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("RAY_DEDUP_LOGS_AGG_WINDOW_S", 5)
+        cluster = ray_start_cluster
+        cluster.add_node(num_cpus=1)
+        cluster.add_node(num_cpus=1)
+        cluster.add_node(num_cpus=1)
+
+        script = """
+import ray
+import time
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+ray.init()
+
+@ray.remote(num_cpus=0)
+class Foo:
+    def __init__(self):
+        time.sleep(1)
+
+# NOTE: We should save actor, otherwise it will be out of scope.
+actors = [Foo.remote() for _ in range(30)]
+for actor in actors:
+    try:
+        ray.get(actor.__ray_ready__.remote())
+    except ray.exceptions.OutOfMemoryError:
+        # When running the test on a small machine,
+        # some actors might be killed by the memory monitor.
+        # We just catch and ignore the error.
+        pass
+"""
+        out_str = run_string_as_driver(script)
+        print(out_str)
+    assert "PYTHON worker processes have been started" in out_str
+    assert out_str.count("RAY_DEDUP_LOGS") == 1
+    assert "[repeated" in out_str
+
+
+def test_logger_config_with_ray_init():
+    """Test that the logger is correctly configured when ray.init is called."""
+
+    script = """
+import ray
+
 ray.init(num_cpus=1)
+    """
+
+    out_str = run_string_as_driver(script)
+    assert "INFO" in out_str, out_str
+    assert len(out_str) != 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
+def test_spill_logs():
+    script = """
+import ray
+
+ray.init(object_store_memory=200e6)
+
+x = []
+
+for _ in range(10):
+    x.append(ray.put(bytes(100 * 1024 * 1024)))
+"""
+
+    proc = run_string_as_driver_nonblocking(script, env={"RAY_verbose_spill_logs": "1"})
+    out_str = proc.stdout.read().decode("ascii") + proc.stderr.read().decode("ascii")
+    print(out_str)
+    assert "Spilled " in out_str
+
+    proc = run_string_as_driver_nonblocking(script, env={"RAY_verbose_spill_logs": "0"})
+    out_str = proc.stdout.read().decode("ascii") + proc.stderr.read().decode("ascii")
+    print(out_str)
+    assert "Spilled " not in out_str
+
+
+def _hook(env):
+    return {"env_vars": {"HOOK_KEY": "HOOK_VALUE"}}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
+@pytest.mark.parametrize("skip_hook", [True, False])
+def test_runtime_env_hook(skip_hook):
+    ray_init_snippet = "ray.init(_skip_env_hook=True)" if skip_hook else ""
+
+    script = f"""
+import ray
+import os
+
+{ray_init_snippet}
+
+@ray.remote
+def f():
+    return os.environ.get("HOOK_KEY")
+
+print(ray.get(f.remote()))
+"""
+
+    proc = run_string_as_driver_nonblocking(
+        script, env={"RAY_RUNTIME_ENV_HOOK": "ray.tests.test_output._hook"}
+    )
+    out_str = proc.stdout.read().decode("ascii") + proc.stderr.read().decode("ascii")
+    print(out_str)
+    if skip_hook:
+        assert "HOOK_VALUE" not in out_str
+    else:
+        assert "HOOK_VALUE" in out_str
+
+
+def test_env_hook_skipped_for_ray_client(start_cluster, monkeypatch):
+    monkeypatch.setenv("RAY_RUNTIME_ENV_HOOK", "ray.tests.test_output._hook")
+    cluster, address = start_cluster
+    ray.init(address)
+
+    @ray.remote
+    def f():
+        return os.environ.get("HOOK_KEY")
+
+    using_ray_client = address.startswith("ray://")
+    if using_ray_client:
+        assert ray.get(f.remote()) is None
+    else:
+        assert ray.get(f.remote()) == "HOOK_VALUE"
+
+
+@pytest.mark.parametrize(
+    "ray_start_cluster_head_with_env_vars",
+    [
+        {
+            "num_cpus": 1,
+            "env_vars": {
+                "RAY_enable_autoscaler_v2": "0",
+            },
+        },
+        {
+            "num_cpus": 1,
+            "env_vars": {
+                "RAY_enable_autoscaler_v2": "1",
+            },
+        },
+    ],
+    indirect=True,
+)
+def test_autoscaler_infeasible(ray_start_cluster_head_with_env_vars):
+    script = """
+import ray
+import time
+
+ray.init()
 
 @ray.remote(num_gpus=1)
 def foo():
@@ -28,17 +196,106 @@ x = foo.remote()
 time.sleep(15)
     """
 
+    out_str, err_str = run_string_as_driver_stdout_stderr(script)
+    print(out_str, err_str)
+    assert "Tip:" in out_str, (out_str, err_str)
+    assert "No available node types can fulfill" in out_str, (
+        out_str,
+        err_str,
+    )
+
+
+@pytest.mark.parametrize(
+    "ray_start_cluster_head_with_env_vars",
+    [
+        {
+            "num_cpus": 1,
+            "env_vars": {
+                "RAY_enable_autoscaler_v2": "0",
+            },
+        },
+        {
+            "num_cpus": 1,
+            "env_vars": {
+                "RAY_enable_autoscaler_v2": "1",
+            },
+        },
+    ],
+    indirect=True,
+)
+def test_autoscaler_warn_deadlock(ray_start_cluster_head_with_env_vars):
+    script = """
+import ray
+import time
+
+ray.init()
+
+@ray.remote(num_cpus=1)
+class A:
+    pass
+
+a = A.remote()
+b = A.remote()
+time.sleep(25)
+    """
+
+    out_str, err_str = run_string_as_driver_stdout_stderr(script)
+
+    print(out_str, err_str)
+    assert "Tip:" in out_str, (out_str, err_str)
+
+    if is_autoscaler_v2():
+        assert "No available node types can fulfill resource requests" in out_str, (
+            out_str,
+            err_str,
+        )
+    else:
+        assert "Warning: The following resource request cannot" in out_str, (
+            out_str,
+            err_str,
+        )
+
+
+# TODO(rickyx): Remove this after migration
+@pytest.mark.parametrize(
+    "ray_start_cluster_head_with_env_vars",
+    [
+        {
+            "num_cpus": 1,
+            "resources": {"node:x": 1},
+            "env_vars": {
+                "RAY_enable_autoscaler_v2": "0",
+            },
+        },
+    ],
+    indirect=True,
+)
+def test_autoscaler_no_spam(ray_start_cluster_head_with_env_vars):
+    script = """
+import ray
+import time
+
+# Check that there are no false positives with custom resources.
+ray.init()
+
+@ray.remote(num_cpus=1, resources={"node:x": 1})
+def f():
+    time.sleep(1)
+    print("task done")
+
+ray.get([f.remote() for _ in range(15)])
+    """
+
     proc = run_string_as_driver_nonblocking(script)
     out_str = proc.stdout.read().decode("ascii")
     err_str = proc.stderr.read().decode("ascii")
 
     print(out_str, err_str)
-    assert "Tip:" in out_str
-    assert "Error: No available node types can fulfill" in out_str
+    assert "Tip:" not in out_str
+    assert "Tip:" not in err_str
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
-def test_autoscaler_warn_deadlock():
+def test_autoscaler_prefix():
     script = """
 import ray
 import time
@@ -59,97 +316,184 @@ time.sleep(25)
     err_str = proc.stderr.read().decode("ascii")
 
     print(out_str, err_str)
-    assert "Tip:" in out_str
-    assert "Warning: The following resource request cannot" in out_str
+    assert "(autoscaler" in out_str
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
-def test_autoscaler_no_spam():
+# TODO(rickyx): Remove this after migration
+@pytest.mark.parametrize(
+    "ray_start_cluster_head_with_env_vars",
+    [
+        {
+            "env_vars": {
+                "RAY_enable_autoscaler_v2": "1",
+            },
+        }
+    ],
+    indirect=True,
+)
+def test_autoscaler_v2_stream_events(ray_start_cluster_head_with_env_vars):
+    """
+    Test in autoscaler v2, autoscaler events are streamed directly from
+    events file
+    """
+
     script = """
 import ray
 import time
+from ray.core.generated.event_pb2 import Event as RayEvent
+from ray._private.event.event_logger import get_event_logger
 
-# Check that there are no false positives with custom resources.
-ray.init(num_cpus=1, resources={"node:x": 1})
+ray.init("auto")
 
-@ray.remote(num_cpus=1, resources={"node:x": 1})
-def f():
-    time.sleep(1)
-    print("task done")
+# Get event logger to write autoscaler events.
+log_dir = ray._private.worker.global_worker.node.get_logs_dir_path()
+event_logger = get_event_logger(RayEvent.SourceType.AUTOSCALER, log_dir)
+event_logger.info("Test autoscaler event")
 
-ray.get([f.remote() for _ in range(15)])
+# Block and sleep
+time.sleep(3)
+    """
+    out_str, err_str = run_string_as_driver_stdout_stderr(script)
+    print(out_str)
+    print(err_str)
+    assert "Test autoscaler event" in out_str, (out_str, err_str)
+
+
+@pytest.mark.parametrize(
+    "event_level,expected_msg,unexpected_msg",
+    [
+        ("TRACE", "TRACE,DEBUG,INFO,WARNING,ERROR,FATAL", ""),
+        ("DEBUG", "DEBUG,INFO,WARNING,ERROR,FATAL", "TRACE"),
+        ("INFO", "INFO,WARNING,ERROR,FATAL", "TRACE,DEBUG"),
+        ("WARNING", "WARNING,ERROR,FATAL", "TRACE,DEBUG,INFO"),
+        ("ERROR", "ERROR,FATAL", "TRACE,DEBUG,INFO,WARNING"),
+        ("FATAL", "FATAL", "TRACE,DEBUG,INFO,WARNING,ERROR"),
+    ],
+)
+def test_autoscaler_v2_stream_events_filter_level(
+    shutdown_only, event_level, expected_msg, unexpected_msg, monkeypatch
+):
+    """
+    Test in autoscaler v2, autoscaler events are streamed directly from
+    events file
     """
 
-    proc = run_string_as_driver_nonblocking(script)
-    out_str = proc.stdout.read().decode("ascii")
-    err_str = proc.stderr.read().decode("ascii")
+    script = """
+import ray
+import time
+from ray.core.generated.event_pb2 import Event as RayEvent
+from ray._private.event.event_logger import get_event_logger
 
-    print(out_str, err_str)
-    assert "Tip:" not in out_str
-    assert "Tip:" not in err_str
+ray.init("auto")
+
+# Get event logger to write autoscaler events.
+log_dir = ray._private.worker.global_worker.node.get_logs_dir_path()
+event_logger = get_event_logger(RayEvent.SourceType.AUTOSCALER, log_dir)
+event_logger.trace("TRACE")
+event_logger.debug("DEBUG")
+event_logger.info("INFO")
+event_logger.warning("WARNING")
+event_logger.error("ERROR")
+event_logger.fatal("FATAL")
+
+# Block and sleep
+time.sleep(3)
+    """
+
+    ray.init(_system_config={"enable_autoscaler_v2": True})
+
+    env = os.environ.copy()
+    env["RAY_LOG_TO_DRIVER_EVENT_LEVEL"] = event_level
+
+    out_str, err_str = run_string_as_driver_stdout_stderr(script, env=env)
+    print(out_str)
+    print(err_str)
+
+    # Filter only autoscaler prints.
+    assert out_str
+
+    out_str = "".join([line for line in out_str.splitlines() if "autoscaler" in line])
+    for expected in expected_msg.split(","):
+        assert expected in out_str
+    if unexpected_msg:
+        for unexpected in unexpected_msg.split(","):
+            assert unexpected not in out_str
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 def test_fail_importing_actor(ray_start_regular, error_pubsub):
-    script = """
+    script = f"""
 import os
 import sys
 import tempfile
 import ray
 
-ray.init()
+ray.init(address='{ray_start_regular.address_info["address"]}')
 temporary_python_file = '''
 def temporary_helper_function():
    return 1
 '''
 
-f = tempfile.NamedTemporaryFile(suffix=".py")
-f.write(temporary_python_file.encode("ascii"))
+f = tempfile.NamedTemporaryFile("w+", suffix=".py", prefix="_", delete=True)
+f_name = f.name
+f.close()
+f = open(f_name, "w+")
+f.write(temporary_python_file)
 f.flush()
-directory = os.path.dirname(f.name)
+directory = os.path.dirname(f_name)
 # Get the module name and strip ".py" from the end.
-module_name = os.path.basename(f.name)[:-3]
+module_name = os.path.basename(f_name)[:-3]
 sys.path.append(directory)
 module = __import__(module_name)
 
 # Define an actor that closes over this temporary module. This should
 # fail when it is unpickled.
-@ray.remote
+@ray.remote(max_restarts=0)
 class Foo:
     def __init__(self):
         self.x = module.temporary_python_file()
-
+    def ready(self):
+        pass
 a = Foo.remote()
+try:
+    ray.get(a.ready.remote())
+except Exception as e:
+    pass
+from time import sleep
+sleep(3)
 """
     proc = run_string_as_driver_nonblocking(script)
     out_str = proc.stdout.read().decode("ascii")
     err_str = proc.stderr.read().decode("ascii")
     print(out_str)
+    print("-----")
     print(err_str)
     assert "ModuleNotFoundError: No module named" in err_str
     assert "RuntimeError: The actor with name Foo failed to import" in err_str
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 def test_fail_importing_task(ray_start_regular, error_pubsub):
-    script = """
+    script = f"""
 import os
 import sys
 import tempfile
 import ray
 
-ray.init()
+ray.init(address='{ray_start_regular.address_info["address"]}')
 temporary_python_file = '''
 def temporary_helper_function():
    return 1
 '''
 
-f = tempfile.NamedTemporaryFile(suffix=".py")
-f.write(temporary_python_file.encode("ascii"))
+f = tempfile.NamedTemporaryFile("w+", suffix=".py", prefix="_", delete=True)
+f_name = f.name
+f.close()
+f = open(f_name, "w+")
+f.write(temporary_python_file)
 f.flush()
-directory = os.path.dirname(f.name)
+directory = os.path.dirname(f_name)
 # Get the module name and strip ".py" from the end.
-module_name = os.path.basename(f.name)[:-3]
+module_name = os.path.basename(f_name)[:-3]
 sys.path.append(directory)
 module = __import__(module_name)
 
@@ -170,7 +514,6 @@ ray.get(foo.remote())
     assert "RuntimeError: The remote function failed to import" in err_str
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 def test_worker_stdout():
     script = """
 import ray
@@ -190,12 +533,13 @@ ray.get(foo.remote("abc", "def"))
     out_str = proc.stdout.read().decode("ascii")
     err_str = proc.stderr.read().decode("ascii")
 
-    assert out_str.endswith("abc\n"), out_str
+    out_str = "".join(out_str.splitlines())
+    assert out_str.endswith("abc"), out_str
     assert "(foo pid=" in out_str, out_str
-    assert err_str.split("\n")[-2].endswith("def")
+    err_str_sec_last = "".join(err_str.split("\n")[-2].splitlines())
+    assert err_str_sec_last.endswith("def")
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 def test_core_worker_error_message():
     script = """
 import ray
@@ -205,7 +549,7 @@ ray.init(local_mode=True)
 
 # In local mode this generates an ERROR level log.
 ray._private.utils.push_error_to_driver(
-    ray.worker.global_worker, "type", "Hello there")
+    ray._private.worker.global_worker, "type", "Hello there")
     """
 
     proc = run_string_as_driver_nonblocking(script)
@@ -255,7 +599,6 @@ ray.util.rpdb._driver_set_trace()  # This should disable worker logs.
     # TODO(ekl) nice to test resuming logs too, but it's quite complicated
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 @pytest.mark.parametrize("file", ["stdout", "stderr"])
 def test_multi_stdout_err(file):
     if file == "stdout":
@@ -292,12 +635,12 @@ ray.get(baz.remote())
     else:
         out_str = proc.stderr.read().decode("ascii")
 
+    out_str = "".join(out_str.splitlines())
     assert "(foo pid=" in out_str, out_str
     assert "(bar pid=" in out_str, out_str
     assert "(baz pid=" in out_str, out_str
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 @pytest.mark.parametrize("file", ["stdout", "stderr"])
 def test_actor_stdout(file):
     if file == "stdout":
@@ -337,38 +680,55 @@ ray.get(b.f.remote())
         out_str = proc.stdout.read().decode("ascii")
     else:
         out_str = proc.stderr.read().decode("ascii")
-    print(out_str)
 
+    out_str = "".join(out_str.splitlines())
     assert "hi" in out_str, out_str
     assert "(Actor1 pid=" in out_str, out_str
     assert "bye" in out_str, out_str
     assert re.search("Actor2 pid=.*init", out_str), out_str
     assert not re.search("ActorX pid=.*init", out_str), out_str
     assert re.search("ActorX pid=.*bye", out_str), out_str
-    assert not re.search("Actor2 pid=.*bye", out_str), out_str
+    assert re.search("Actor2 pid=.*bye", out_str), out_str
 
 
-def test_output():
-    # Use subprocess to execute the __main__ below.
-    outputs = subprocess.check_output(
-        [sys.executable, __file__, "_ray_instance"],
-        stderr=subprocess.STDOUT).decode()
-    lines = outputs.split("\n")
-    for line in lines:
-        print(line)
+def test_output_local_ray():
+    script = """
+import ray
+ray.init()
+    """
+    output = run_string_as_driver(script)
+    lines = output.strip("\n").split("\n")
+    lines = [line for line in lines if "The object store is using /tmp" not in line]
+    assert len(lines) >= 1
+    assert "Started a local Ray instance." in output
     if os.environ.get("RAY_MINIMAL") == "1":
-        # Without "View the Ray dashboard"
-        assert len(lines) == 1, lines
+        assert "View the dashboard" not in output
     else:
-        # With "View the Ray dashboard"
-        assert len(lines) == 2, lines
+        assert "View the dashboard" in output
+
+
+def test_output_ray_cluster(call_ray_start):
+    script = """
+import ray
+ray.init()
+    """
+    output = run_string_as_driver(script)
+    lines = output.strip("\n").split("\n")
+    assert len(lines) >= 1
+    assert "Connecting to existing Ray cluster at address:" in output
+    assert "Connected to Ray cluster." in output
+    if os.environ.get("RAY_MINIMAL") == "1":
+        assert "View the dashboard" not in output
+    else:
+        assert "View the dashboard" in output
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 # TODO: fix this test to support minimal installation
 @pytest.mark.skipif(
     os.environ.get("RAY_MINIMAL") == "1",
-    reason="This test currently fails with minimal install.")
+    reason="This test currently fails with minimal install.",
+)
 def test_output_on_driver_shutdown(ray_start_cluster):
     cluster = ray_start_cluster
     cluster.add_node(num_cpus=16)
@@ -396,7 +756,7 @@ ray.init(address="auto")
 
 run_experiments(
     {
-        "ppo": {
+        "PPO": {
             "run": "PPO",
             "env": "CartPole-v0",
             "num_samples": 10,
@@ -418,6 +778,10 @@ run_experiments(
     # Make sure the script is running before sending a sigterm.
     with pytest.raises(subprocess.TimeoutExpired):
         print(proc.wait(timeout=10))
+        std_str = proc.stdout.read().decode("ascii")
+        err_str = proc.stderr.read().decode("ascii")
+        print(f"STDOUT:\n{std_str}")
+        print(f"STDERR:\n{err_str}")
     print(f"Script is running... pid: {proc.pid}")
     # Send multiple signals to terminate it like real world scenario.
     for _ in range(10):
@@ -438,7 +802,8 @@ run_experiments(
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
 @pytest.mark.skipif(
     os.environ.get("RAY_MINIMAL") == "1",
-    reason="This test currently fails with minimal install.")
+    reason="This test currently fails with minimal install.",
+)
 @pytest.mark.parametrize("execution_number", range(3))
 def test_empty_line_thread_safety_bug(execution_number, ray_start_cluster):
     """Make sure when new threads are used within __init__,
@@ -497,6 +862,37 @@ time.sleep(5)
     assert actor_repr not in out
 
 
+def test_node_name_in_raylet_death():
+    NODE_NAME = "RAY_TEST_RAYLET_DEATH_NODE_NAME"
+    script = f"""
+import time
+import os
+
+WAIT_BUFFER_SECONDS=5
+
+os.environ["RAY_pull_based_healthcheck"]="true"
+os.environ["RAY_health_check_initial_delay_ms"]="0"
+os.environ["RAY_health_check_period_ms"]="1000"
+os.environ["RAY_health_check_timeout_ms"]="10"
+os.environ["RAY_health_check_failure_threshold"]="2"
+sleep_time = float(os.environ["RAY_health_check_period_ms"]) / 1000.0 * \
+    int(os.environ["RAY_health_check_failure_threshold"])
+sleep_time += WAIT_BUFFER_SECONDS
+
+import ray
+
+ray.init(_node_name=\"{NODE_NAME}\")
+# This will kill raylet without letting it exit gracefully.
+ray._private.worker._global_node.kill_raylet()
+
+time.sleep(sleep_time)
+ray.shutdown()
+    """
+    out = run_string_as_driver(script)
+    print(out)
+    assert out.count(f"node name: {NODE_NAME} has been marked dead") == 1
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "_ray_instance":
         # Set object store memory very low so that it won't complain
@@ -507,4 +903,7 @@ if __name__ == "__main__":
         ray.init(num_cpus=1, object_store_memory=(100 * MB))
         ray.shutdown()
     else:
-        sys.exit(pytest.main(["-v", __file__]))
+        if os.environ.get("PARALLEL_CI"):
+            sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+        else:
+            sys.exit(pytest.main(["-sv", __file__]))

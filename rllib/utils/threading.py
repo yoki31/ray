@@ -1,6 +1,9 @@
 from typing import Callable
 
+from ray.rllib.utils.annotations import OldAPIStack
 
+
+@OldAPIStack
 def with_lock(func: Callable) -> Callable:
     """Use as decorator (@withlock) around object methods that need locking.
 
@@ -24,7 +27,8 @@ def with_lock(func: Callable) -> Callable:
                 raise AttributeError(
                     "Object {} must have a `self._lock` property (assigned "
                     "to a threading.RLock() object in its "
-                    "constructor)!".format(self))
+                    "constructor)!".format(self)
+                )
             raise e
 
     return wrapper

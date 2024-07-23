@@ -87,14 +87,13 @@ void AbstractRayRuntime::Put(std::shared_ptr<msgpack::sbuffer> data,
 }
 
 std::string AbstractRayRuntime::Put(std::shared_ptr<msgpack::sbuffer> data) {
-  ObjectID object_id =
-      ObjectID::FromIndex(worker_->GetCurrentTaskID(), worker_->GetNextPutIndex());
-  Put(data, &object_id);
+  ObjectID object_id;
+  object_store_->Put(data, &object_id);
   return object_id.Binary();
 }
 
 std::shared_ptr<msgpack::sbuffer> AbstractRayRuntime::Get(const std::string &object_id) {
-  return object_store_->Get(ObjectID::FromBinary(object_id), -1);
+  return Get(object_id, -1);
 }
 
 inline static std::vector<ObjectID> StringIDsToObjectIDs(
@@ -108,16 +107,27 @@ inline static std::vector<ObjectID> StringIDsToObjectIDs(
 
 std::vector<std::shared_ptr<msgpack::sbuffer>> AbstractRayRuntime::Get(
     const std::vector<std::string> &ids) {
-  return object_store_->Get(StringIDsToObjectIDs(ids), -1);
+  return Get(ids, -1);
+}
+
+std::shared_ptr<msgpack::sbuffer> AbstractRayRuntime::Get(const std::string &object_id,
+                                                          const int &timeout_ms) {
+  return object_store_->Get(ObjectID::FromBinary(object_id), timeout_ms);
+}
+
+std::vector<std::shared_ptr<msgpack::sbuffer>> AbstractRayRuntime::Get(
+    const std::vector<std::string> &ids, const int &timeout_ms) {
+  return object_store_->Get(StringIDsToObjectIDs(ids), timeout_ms);
 }
 
 std::vector<bool> AbstractRayRuntime::Wait(const std::vector<std::string> &ids,
-                                           int num_objects, int timeout_ms) {
+                                           int num_objects,
+                                           int timeout_ms) {
   return object_store_->Wait(StringIDsToObjectIDs(ids), num_objects, timeout_ms);
 }
 
 std::vector<std::unique_ptr<::ray::TaskArg>> TransformArgs(
-    std::vector<ray::internal::TaskArg> &args) {
+    std::vector<ray::internal::TaskArg> &args, bool cross_lang) {
   std::vector<std::unique_ptr<::ray::TaskArg>> ray_args;
   for (auto &arg : args) {
     std::unique_ptr<::ray::TaskArg> ray_arg = nullptr;
@@ -125,12 +135,26 @@ std::vector<std::unique_ptr<::ray::TaskArg>> TransformArgs(
       auto &buffer = *arg.buf;
       auto memory_buffer = std::make_shared<ray::LocalMemoryBuffer>(
           reinterpret_cast<uint8_t *>(buffer.data()), buffer.size(), true);
+      std::shared_ptr<Buffer> metadata = nullptr;
+      if (cross_lang) {
+        auto meta_str = arg.meta_str;
+        metadata = std::make_shared<ray::LocalMemoryBuffer>(
+            reinterpret_cast<uint8_t *>(const_cast<char *>(meta_str.data())),
+            meta_str.size(),
+            true);
+      }
       ray_arg = absl::make_unique<ray::TaskArgByValue>(std::make_shared<ray::RayObject>(
-          memory_buffer, nullptr, std::vector<rpc::ObjectReference>()));
+          memory_buffer, metadata, std::vector<rpc::ObjectReference>()));
     } else {
       RAY_CHECK(arg.id);
-      ray_arg = absl::make_unique<ray::TaskArgByReference>(ObjectID::FromBinary(*arg.id),
-                                                           ray::rpc::Address{},
+      auto id = ObjectID::FromBinary(*arg.id);
+      auto owner_address = ray::rpc::Address{};
+      if (ConfigInternal::Instance().run_mode == RunMode::CLUSTER) {
+        auto &core_worker = CoreWorkerProcess::GetCoreWorker();
+        owner_address = core_worker.GetOwnerAddressOrDie(id);
+      }
+      ray_arg = absl::make_unique<ray::TaskArgByReference>(id,
+                                                           owner_address,
                                                            /*call_site=*/"");
     }
     ray_args.push_back(std::move(ray_arg));
@@ -147,7 +171,8 @@ InvocationSpec BuildInvocationSpec1(TaskType task_type,
   invocation_spec.task_type = task_type;
   invocation_spec.remote_function_holder = remote_function_holder;
   invocation_spec.actor_id = actor;
-  invocation_spec.args = TransformArgs(args);
+  invocation_spec.args =
+      TransformArgs(args, remote_function_holder.lang_type != LangType::CPP);
   return invocation_spec;
 }
 
@@ -169,21 +194,48 @@ std::string AbstractRayRuntime::CreateActor(
 }
 
 std::string AbstractRayRuntime::CallActor(
-    const RemoteFunctionHolder &remote_function_holder, const std::string &actor,
-    std::vector<ray::internal::TaskArg> &args, const CallOptions &call_options) {
-  auto invocation_spec = BuildInvocationSpec1(
-      TaskType::ACTOR_TASK, remote_function_holder, args, ActorID::FromBinary(actor));
+    const RemoteFunctionHolder &remote_function_holder,
+    const std::string &actor,
+    std::vector<ray::internal::TaskArg> &args,
+    const CallOptions &call_options) {
+  InvocationSpec invocation_spec{};
+  if (remote_function_holder.lang_type == LangType::PYTHON) {
+    const auto native_actor_handle = CoreWorkerProcess::GetCoreWorker().GetActorHandle(
+        ray::ActorID::FromBinary(actor));
+    auto function_descriptor = native_actor_handle->ActorCreationTaskFunctionDescriptor();
+    auto typed_descriptor = function_descriptor->As<PythonFunctionDescriptor>();
+    RemoteFunctionHolder func_holder = remote_function_holder;
+    func_holder.module_name = typed_descriptor->ModuleName();
+    func_holder.class_name = typed_descriptor->ClassName();
+    invocation_spec = BuildInvocationSpec1(
+        TaskType::ACTOR_TASK, func_holder, args, ActorID::FromBinary(actor));
+  } else if (remote_function_holder.lang_type == LangType::JAVA) {
+    const auto native_actor_handle = CoreWorkerProcess::GetCoreWorker().GetActorHandle(
+        ray::ActorID::FromBinary(actor));
+    auto function_descriptor = native_actor_handle->ActorCreationTaskFunctionDescriptor();
+    auto typed_descriptor = function_descriptor->As<JavaFunctionDescriptor>();
+    RemoteFunctionHolder func_holder = remote_function_holder;
+    func_holder.class_name = typed_descriptor->ClassName();
+    invocation_spec = BuildInvocationSpec1(
+        TaskType::ACTOR_TASK, func_holder, args, ActorID::FromBinary(actor));
+  } else {
+    invocation_spec = BuildInvocationSpec1(
+        TaskType::ACTOR_TASK, remote_function_holder, args, ActorID::FromBinary(actor));
+  }
+
   return task_submitter_->SubmitActorTask(invocation_spec, call_options).Binary();
 }
 
 const TaskID &AbstractRayRuntime::GetCurrentTaskId() {
-  return worker_->GetCurrentTaskID();
+  return GetWorkerContext().GetCurrentTaskID();
 }
 
-const JobID &AbstractRayRuntime::GetCurrentJobID() { return worker_->GetCurrentJobID(); }
+JobID AbstractRayRuntime::GetCurrentJobID() {
+  return GetWorkerContext().GetCurrentJobID();
+}
 
-const std::unique_ptr<WorkerContext> &AbstractRayRuntime::GetWorkerContext() {
-  return worker_;
+const ActorID &AbstractRayRuntime::GetCurrentActorID() {
+  return GetWorkerContext().GetCurrentActorID();
 }
 
 void AbstractRayRuntime::AddLocalReference(const std::string &id) {
@@ -200,8 +252,9 @@ void AbstractRayRuntime::RemoveLocalReference(const std::string &id) {
   }
 }
 
-std::string AbstractRayRuntime::GetActorId(const std::string &actor_name) {
-  auto actor_id = task_submitter_->GetActor(actor_name);
+std::string AbstractRayRuntime::GetActorId(const std::string &actor_name,
+                                           const std::string &ray_namespace) {
+  auto actor_id = task_submitter_->GetActor(actor_name, ray_namespace);
   if (actor_id.IsNil()) {
     return "";
   }
@@ -262,7 +315,7 @@ void AbstractRayRuntime::RemovePlacementGroup(const std::string &group_id) {
 }
 
 bool AbstractRayRuntime::WaitPlacementGroupReady(const std::string &group_id,
-                                                 int timeout_seconds) {
+                                                 int64_t timeout_seconds) {
   return task_submitter_->WaitPlacementGroupReady(group_id, timeout_seconds);
 }
 
@@ -280,7 +333,8 @@ PlacementGroup AbstractRayRuntime::GeneratePlacementGroup(const std::string &str
     options.bundles.emplace_back(bundle);
   }
   options.strategy = PlacementStrategy(pg_table_data.strategy());
-  PlacementGroup group(pg_table_data.placement_group_id(), std::move(options),
+  PlacementGroup group(pg_table_data.placement_group_id(),
+                       std::move(options),
                        PlacementGroupState(pg_table_data.state()));
   return group;
 }
@@ -307,12 +361,38 @@ PlacementGroup AbstractRayRuntime::GetPlacementGroupById(const std::string &id) 
 }
 
 PlacementGroup AbstractRayRuntime::GetPlacementGroup(const std::string &name) {
-  auto str_ptr = global_state_accessor_->GetPlacementGroupByName(name, "");
+  // TODO(WangTaoTheTonic): Add namespace support for placement group.
+  auto str_ptr = global_state_accessor_->GetPlacementGroupByName(
+      name, CoreWorkerProcess::GetCoreWorker().GetJobConfig().ray_namespace());
   if (str_ptr == nullptr) {
     return {};
   }
   PlacementGroup group = GeneratePlacementGroup(*str_ptr);
   return group;
+}
+
+std::string AbstractRayRuntime::GetNamespace() {
+  auto &core_worker = CoreWorkerProcess::GetCoreWorker();
+  return core_worker.GetJobConfig().ray_namespace();
+}
+
+std::string AbstractRayRuntime::SerializeActorHandle(const std::string &actor_id) {
+  auto &core_worker = CoreWorkerProcess::GetCoreWorker();
+  std::string output;
+  ObjectID actor_handle_id;
+  auto status = core_worker.SerializeActorHandle(
+      ActorID::FromBinary(actor_id), &output, &actor_handle_id);
+  return output;
+}
+
+std::string AbstractRayRuntime::DeserializeAndRegisterActorHandle(
+    const std::string &serialized_actor_handle) {
+  auto &core_worker = CoreWorkerProcess::GetCoreWorker();
+  return core_worker
+      .DeserializeAndRegisterActorHandle(serialized_actor_handle,
+                                         ObjectID::Nil(),
+                                         /*add_local_ref=*/true)
+      .Binary();
 }
 
 }  // namespace internal

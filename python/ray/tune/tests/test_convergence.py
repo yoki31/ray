@@ -1,17 +1,18 @@
 import math
-import numpy as np
-
-import pytest
-import ray
-from ray import tune
-from ray.tune.stopper import ExperimentPlateauStopper
-from ray.tune.suggest import ConcurrencyLimiter
 import unittest
 
+import numpy as np
+import pytest
 
-def loss(config, reporter):
+import ray
+from ray import train, tune
+from ray.tune.search import ConcurrencyLimiter
+from ray.tune.stopper import ExperimentPlateauStopper
+
+
+def loss(config):
     x = config.get("x")
-    reporter(loss=x**2)  # A simple function to optimize
+    train.report({"loss": x**2})  # A simple function to optimize
 
 
 class ConvergenceTest(unittest.TestCase):
@@ -35,23 +36,26 @@ class ConvergenceTest(unittest.TestCase):
             loss,
             metric="loss",
             mode="min",
-            stop=ExperimentPlateauStopper(
-                metric="loss", top=top, patience=patience),
+            stop=ExperimentPlateauStopper(metric="loss", top=top, patience=patience),
             search_alg=searcher,
             config=space,
-            num_samples=100,  # Number of iterations
+            num_samples=max(100, patience),  # Number of iterations
             resources_per_trial=resources_per_trial,
             raise_on_failed_trial=False,
             fail_fast=True,
             reuse_actors=True,
-            verbose=1)
-        print(f"Num trials: {len(analysis.trials)}. "
-              f"Best result: {analysis.best_config['x']}")
+            verbose=1,
+        )
+        print(
+            f"Num trials: {len(analysis.trials)}. "
+            f"Best result: {analysis.best_config['x']}"
+        )
 
         return analysis
 
+    @unittest.skip("ax warm start tests currently failing (need to upgrade ax)")
     def testConvergenceAx(self):
-        from ray.tune.suggest.ax import AxSearch
+        from ray.tune.search.ax import AxSearch
 
         np.random.seed(0)
 
@@ -61,7 +65,7 @@ class ConvergenceTest(unittest.TestCase):
         assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-5)
 
     def testConvergenceBayesOpt(self):
-        from ray.tune.suggest.bayesopt import BayesOptSearch
+        from ray.tune.search.bayesopt import BayesOptSearch
 
         np.random.seed(0)
 
@@ -75,36 +79,8 @@ class ConvergenceTest(unittest.TestCase):
         assert len(analysis.trials) < 50
         assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-5)
 
-    def testConvergenceBlendSearch(self):
-        from ray.tune.suggest.flaml import BlendSearch
-
-        np.random.seed(0)
-        searcher = BlendSearch()
-        analysis = self._testConvergence(searcher, patience=10)
-
-        assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-5)
-
-    def testConvergenceCFO(self):
-        from ray.tune.suggest.flaml import CFO
-
-        np.random.seed(0)
-        searcher = CFO()
-        analysis = self._testConvergence(searcher, patience=10)
-
-        assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-5)
-
-    def testConvergenceDragonfly(self):
-        from ray.tune.suggest.dragonfly import DragonflySearch
-
-        np.random.seed(0)
-        searcher = DragonflySearch(domain="euclidean", optimizer="bandit")
-        analysis = self._testConvergence(searcher)
-
-        assert len(analysis.trials) < 100
-        assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-5)
-
     def testConvergenceHEBO(self):
-        from ray.tune.suggest.hebo import HEBOSearch
+        from ray.tune.search.hebo import HEBOSearch
 
         np.random.seed(0)
         searcher = HEBOSearch()
@@ -114,7 +90,7 @@ class ConvergenceTest(unittest.TestCase):
         assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-2)
 
     def testConvergenceHyperopt(self):
-        from ray.tune.suggest.hyperopt import HyperOptSearch
+        from ray.tune.search.hyperopt import HyperOptSearch
 
         np.random.seed(0)
         searcher = HyperOptSearch(random_state_seed=1234)
@@ -123,8 +99,9 @@ class ConvergenceTest(unittest.TestCase):
         assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-2)
 
     def testConvergenceNevergrad(self):
-        from ray.tune.suggest.nevergrad import NevergradSearch
         import nevergrad as ng
+
+        from ray.tune.search.nevergrad import NevergradSearch
 
         np.random.seed(0)
         searcher = NevergradSearch(optimizer=ng.optimizers.PSO)
@@ -133,7 +110,7 @@ class ConvergenceTest(unittest.TestCase):
         assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-3)
 
     def testConvergenceOptuna(self):
-        from ray.tune.suggest.optuna import OptunaSearch
+        from ray.tune.search.optuna import OptunaSearch
 
         np.random.seed(1)
         searcher = OptunaSearch(seed=1)
@@ -148,18 +125,8 @@ class ConvergenceTest(unittest.TestCase):
         assert len(analysis.trials) < 100
         assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-1)
 
-    def testConvergenceSkOpt(self):
-        from ray.tune.suggest.skopt import SkOptSearch
-
-        np.random.seed(0)
-        searcher = SkOptSearch()
-        analysis = self._testConvergence(searcher)
-
-        assert len(analysis.trials) < 100
-        assert math.isclose(analysis.best_config["x"], 0, abs_tol=1e-3)
-
     def testConvergenceZoopt(self):
-        from ray.tune.suggest.zoopt import ZOOptSearch
+        from ray.tune.search.zoopt import ZOOptSearch
 
         np.random.seed(0)
         searcher = ZOOptSearch(budget=100)
@@ -171,4 +138,5 @@ class ConvergenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main(["-v", __file__]))

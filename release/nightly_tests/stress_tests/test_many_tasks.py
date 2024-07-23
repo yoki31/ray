@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 
 import argparse
-from collections import defaultdict
-import numpy as np
 import json
 import logging
 import os
 import time
+from collections import defaultdict
+
+import numpy as np
 
 import ray
 
@@ -25,6 +26,9 @@ def f(size, *xs):
 class Actor(object):
     def method(self, size, *xs):
         return np.ones(size, dtype=np.uint8)
+
+    def ready(self):
+        pass
 
 
 # Stage 0: Submit a bunch of small tasks with large returns.
@@ -83,11 +87,10 @@ def stage2(smoke=False):
     for _ in range(5):
         iteration_start = time.time()
         for i in range(20):
-            logger.info("Iteration %s. Cumulative time %s seconds", i,
-                        time.time() - start_time)
-            x_ids = [
-                f.remote(0, *x_ids) for _ in range(num_tasks_per_iteration)
-            ]
+            logger.info(
+                "Iteration %s. Cumulative time %s seconds", i, time.time() - start_time
+            )
+            x_ids = [f.remote(0, *x_ids) for _ in range(num_tasks_per_iteration)]
         ray.get(x_ids)
         stage_2_iterations.append(time.time() - iteration_start)
         logger.info("Finished after %s seconds.", time.time() - start_time)
@@ -99,9 +102,9 @@ def stage3(total_num_remote_cpus, smoke=False):
     start_time = time.time()
     logger.info("Creating %s actors.", total_num_remote_cpus)
     actors = [Actor.remote() for _ in range(total_num_remote_cpus)]
+    ray.get([actor.ready.remote() for actor in actors])
     stage_3_creation_time = time.time() - start_time
-    logger.info("Finished stage 3 actor creation in %s seconds.",
-                stage_3_creation_time)
+    logger.info("Finished stage 3 actor creation in %s seconds.", stage_3_creation_time)
 
     num_tasks = 1000
 
@@ -140,7 +143,7 @@ def stage4():
         start = time.perf_counter()
         time.sleep(1)
         end = time.perf_counter()
-        return start, end, ray.worker.global_worker.node.unique_id
+        return start, end, ray._private.worker.global_worker.node.unique_id
 
     results = ray.get([func.remote(i) for i in range(num_tasks)])
 
@@ -156,8 +159,8 @@ def stage4():
         spreads.append(spread)
         logger.info(f"Spread: {last - first}\tLast: {last}\tFirst: {first}")
 
-    avg_spread = sum(spreads) / len(spreads)
-    logger.info(f"Avg spread: {sum(spreads)/len(spreads)}")
+    avg_spread = np.mean(spreads)
+    logger.info(f"Avg spread: {np.mean(spreads)}")
     return avg_spread
 
 
@@ -179,16 +182,14 @@ if __name__ == "__main__":
     is_smoke_test = args.smoke_test
 
     result = {"success": 0}
-    # Wait until the expected number of nodes have joined the cluster.
-    while True:
-        num_nodes = len(ray.nodes())
-        logger.info("Waiting for nodes {}/{}".format(num_nodes,
-                                                     num_remote_nodes + 1))
-        if num_nodes >= num_remote_nodes + 1:
-            break
-        time.sleep(5)
-    logger.info("Nodes have all joined. There are %s resources.",
-                ray.cluster_resources())
+    num_nodes = len(ray.nodes())
+    assert (
+        num_nodes == num_remote_nodes + 1
+    ), f"{num_nodes}/{num_remote_nodes+1} are available"
+
+    logger.info(
+        "Nodes have all joined. There are %s resources.", ray.cluster_resources()
+    )
 
     stage_0_time = stage0(smoke=is_smoke_test)
     logger.info("Finished stage 0 after %s seconds.", stage_0_time)
@@ -198,7 +199,8 @@ if __name__ == "__main__":
     logger.info("Finished stage 1 after %s seconds.", stage_1_time)
     result["stage_1_time"] = stage_1_time
     result["stage_1_avg_iteration_time"] = sum(stage_1_iterations) / len(
-        stage_1_iterations)
+        stage_1_iterations
+    )
     result["stage_1_max_iteration_time"] = max(stage_1_iterations)
     result["stage_1_min_iteration_time"] = min(stage_1_iterations)
 
@@ -206,12 +208,14 @@ if __name__ == "__main__":
     logger.info("Finished stage 2 after %s seconds.", stage_2_time)
     result["stage_2_time"] = stage_2_time
     result["stage_2_avg_iteration_time"] = sum(stage_2_iterations) / len(
-        stage_2_iterations)
+        stage_2_iterations
+    )
     result["stage_2_max_iteration_time"] = max(stage_2_iterations)
     result["stage_2_min_iteration_time"] = min(stage_2_iterations)
 
     stage_3_time, stage_3_creation_time = stage3(
-        total_num_remote_cpus, smoke=is_smoke_test)
+        total_num_remote_cpus, smoke=is_smoke_test
+    )
     logger.info("Finished stage 3 in %s seconds.", stage_3_time)
     result["stage_3_creation_time"] = stage_3_creation_time
     result["stage_3_time"] = stage_3_time
@@ -221,6 +225,40 @@ if __name__ == "__main__":
     # scheduler.
     result["stage_4_spread"] = stage_4_spread
     result["success"] = 1
+
+    if not is_smoke_test:
+        result["perf_metrics"] = [
+            {
+                "perf_metric_name": "stage_0_time",
+                "perf_metric_value": stage_0_time,
+                "perf_metric_type": "LATENCY",
+            },
+            {
+                "perf_metric_name": "stage_1_avg_iteration_time",
+                "perf_metric_value": result["stage_1_avg_iteration_time"],
+                "perf_metric_type": "LATENCY",
+            },
+            {
+                "perf_metric_name": "stage_2_avg_iteration_time",
+                "perf_metric_value": result["stage_2_avg_iteration_time"],
+                "perf_metric_type": "LATENCY",
+            },
+            {
+                "perf_metric_name": "stage_3_creation_time",
+                "perf_metric_value": result["stage_3_creation_time"],
+                "perf_metric_type": "LATENCY",
+            },
+            {
+                "perf_metric_name": "stage_3_time",
+                "perf_metric_value": result["stage_3_time"],
+                "perf_metric_type": "LATENCY",
+            },
+            {
+                "perf_metric_name": "stage_4_spread",
+                "perf_metric_value": result["stage_4_spread"],
+                "perf_metric_type": "LATENCY",
+            },
+        ]
     print("PASSED.")
 
     # TODO(rkn): The test below is commented out because it currently

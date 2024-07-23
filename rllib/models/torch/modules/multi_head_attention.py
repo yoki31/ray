@@ -5,22 +5,25 @@
 """
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.models.torch.misc import SlimFC
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.torch_utils import sequence_mask
 from ray.rllib.utils.framework import TensorType
 
 torch, nn = try_import_torch()
 
 
+@OldAPIStack
 class MultiHeadAttention(nn.Module):
     """A multi-head attention layer described in [1]."""
 
-    def __init__(self, in_dim: int, out_dim: int, num_heads: int,
-                 head_dim: int, **kwargs):
+    def __init__(
+        self, in_dim: int, out_dim: int, num_heads: int, head_dim: int, **kwargs
+    ):
         """
-        in_dim (int): Dimension of input
-        out_dim (int): Dimension of output
-        num_heads (int): Number of attention heads
-        head_dim (int): Output dimension of each attention head
+        in_dim: Dimension of input
+        out_dim: Dimension of output
+        num_heads: Number of attention heads
+        head_dim: Output dimension of each attention head
         """
         super().__init__(**kwargs)
 
@@ -28,10 +31,12 @@ class MultiHeadAttention(nn.Module):
         self._num_heads = num_heads
         self._head_dim = head_dim
         self._qkv_layer = SlimFC(
-            in_size=in_dim, out_size=3 * num_heads * head_dim, use_bias=False)
+            in_size=in_dim, out_size=3 * num_heads * head_dim, use_bias=False
+        )
 
         self._linear_layer = SlimFC(
-            in_size=num_heads * head_dim, out_size=out_dim, use_bias=False)
+            in_size=num_heads * head_dim, out_size=out_dim, use_bias=False
+        )
 
     def forward(self, inputs: TensorType) -> TensorType:
         L = list(inputs.size())[1]  # length of segment
@@ -55,7 +60,7 @@ class MultiHeadAttention(nn.Module):
         mask = mask[None, :, :, None]
         mask = mask.float()
 
-        masked_score = score * mask + 1e30 * (mask - 1.)
+        masked_score = score * mask + 1e30 * (mask - 1.0)
         wmat = nn.functional.softmax(masked_score, dim=2)
 
         out = torch.einsum("bijh,bjhd->bihd", wmat, values)

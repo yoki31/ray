@@ -3,8 +3,14 @@ import unittest
 
 import pytest
 import ray
-from ray.rllib.agents import ppo, sac
-from ray.rllib.agents.callbacks import RE3UpdateCallbacks
+from ray.rllib.utils.test_utils import framework_iterator
+import ray.rllib.algorithms.ppo as ppo
+import ray.rllib.algorithms.sac as sac
+from ray.rllib.algorithms.callbacks import RE3UpdateCallbacks
+from ray.rllib.utils.metrics import (
+    ENV_RUNNER_RESULTS,
+    EPISODE_RETURN_MAX,
+)
 
 
 class TestRE3(unittest.TestCase):
@@ -24,19 +30,23 @@ class TestRE3(unittest.TestCase):
         Both the on-policy and off-policy setups are validated.
         """
         if rl_algorithm == "PPO":
-            config = ppo.DEFAULT_CONFIG.copy()
-            trainer_cls = ppo.PPOTrainer
+            # We need to disable the RLModule / Learner API here, since this test is
+            # overfitted to the ModelV2 API stack. The random encoder is based on
+            # ModelV2 stack.
+            config = ppo.PPOConfig()
+            algo_cls = ppo.PPO
             beta_schedule = "constant"
         elif rl_algorithm == "SAC":
-            config = sac.DEFAULT_CONFIG.copy()
-            trainer_cls = sac.SACTrainer
+            config = sac.SACConfig()
+            algo_cls = sac.SAC
             beta_schedule = "linear_decay"
+
+        config = config.to_dict()
 
         class RE3Callbacks(RE3UpdateCallbacks, config["callbacks"]):
             pass
 
         config["env"] = "Pendulum-v1"
-        config["seed"] = 12345
         config["callbacks"] = RE3Callbacks
         config["exploration_config"] = {
             "type": "RE3",
@@ -44,21 +54,22 @@ class TestRE3(unittest.TestCase):
             "beta_schedule": beta_schedule,
             "sub_exploration": {
                 "type": "StochasticSampling",
-            }
+            },
         }
 
-        num_iterations = 30
-        trainer = trainer_cls(config=config)
-        learnt = False
-        for i in range(num_iterations):
-            result = trainer.train()
-            print(result)
-            if result["episode_reward_max"] > -900.0:
-                print("Reached goal after {} iters!".format(i))
-                learnt = True
-                break
-        trainer.stop()
-        self.assertTrue(learnt)
+        num_iterations = 60
+        for _ in framework_iterator(config, frameworks=("tf", "tf2"), session=True):
+            algo = algo_cls(config=config)
+            learnt = False
+            for i in range(num_iterations):
+                result = algo.train()
+                print(result)
+                if result[ENV_RUNNER_RESULTS][EPISODE_RETURN_MAX] > -900.0:
+                    print("Reached goal after {} iters!".format(i))
+                    learnt = True
+                    break
+            algo.stop()
+            self.assertTrue(learnt)
 
     def test_re3_ppo(self):
         """Tests RE3 with PPO."""

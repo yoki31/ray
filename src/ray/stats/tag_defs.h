@@ -20,22 +20,49 @@
 using TagKeyType = opencensus::tags::TagKey;
 using TagsType = std::vector<std::pair<opencensus::tags::TagKey, std::string>>;
 
-static const TagKeyType ComponentKey = TagKeyType::Register("Component");
+extern const TagKeyType ComponentKey;
 
-static const TagKeyType JobNameKey = TagKeyType::Register("JobName");
+extern const TagKeyType JobNameKey;
 
-static const TagKeyType CustomKey = TagKeyType::Register("CustomKey");
+extern const TagKeyType NodeAddressKey;
 
-static const TagKeyType NodeAddressKey = TagKeyType::Register("NodeAddress");
+extern const TagKeyType VersionKey;
 
-static const TagKeyType VersionKey = TagKeyType::Register("Version");
+extern const TagKeyType LanguageKey;
 
-static const TagKeyType LanguageKey = TagKeyType::Register("Language");
+extern const TagKeyType WorkerPidKey;
 
-static const TagKeyType WorkerPidKey = TagKeyType::Register("WorkerPid");
+extern const TagKeyType DriverPidKey;
 
-static const TagKeyType DriverPidKey = TagKeyType::Register("DriverPid");
+extern const TagKeyType ActorIdKey;
 
-static const TagKeyType ResourceNameKey = TagKeyType::Register("ResourceName");
+extern const TagKeyType WorkerIdKey;
 
-static const TagKeyType ActorIdKey = TagKeyType::Register("ActorId");
+extern const TagKeyType JobIdKey;
+
+extern const TagKeyType SessionNameKey;
+
+extern const TagKeyType NameKey;
+
+extern const TagKeyType SourceKey;
+
+// Object store memory location tag constants
+extern const TagKeyType LocationKey;
+
+constexpr char kResourceNameKey[] = "ResourceName";
+
+constexpr char kCustomKey[] = "CustomKey";
+
+constexpr char kObjectLocMmapShm[] = "MMAP_SHM";
+constexpr char kObjectLocMmapDisk[] = "MMAP_DISK";
+constexpr char kObjectLocSpilled[] = "SPILLED";
+constexpr char kObjectLocWorkerHeap[] = "WORKER_HEAP";
+
+// Object store memory sealed/unsealed tag
+extern const TagKeyType ObjectStateKey;
+constexpr char kObjectSealed[] = "SEALED";
+constexpr char kObjectUnsealed[] = "UNSEALED";
+
+// GCS task manager tags
+constexpr char kGcsTaskStatusEventDropped[] = "STATUS_EVENT";
+constexpr char kGcsProfileEventDropped[] = "PROFILE_EVENT";

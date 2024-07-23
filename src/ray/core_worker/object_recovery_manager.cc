@@ -20,6 +20,11 @@ namespace ray {
 namespace core {
 
 bool ObjectRecoveryManager::RecoverObject(const ObjectID &object_id) {
+  if (object_id.TaskId().IsForActorCreationTask()) {
+    // The GCS manages all actor restarts, so we should never try to
+    // reconstruct an actor here.
+    return true;
+  }
   // Check the ReferenceCounter to see if there is a location for the object.
   bool owned_by_us = false;
   NodeID pinned_at;
@@ -38,7 +43,8 @@ bool ObjectRecoveryManager::RecoverObject(const ObjectID &object_id) {
   }
 
   bool already_pending_recovery = true;
-  if (pinned_at.IsNil() && !spilled) {
+  bool requires_recovery = pinned_at.IsNil() && !spilled;
+  if (requires_recovery) {
     {
       absl::MutexLock lock(&mu_);
       // Mark that we are attempting recovery for this object to prevent
@@ -61,8 +67,17 @@ bool ObjectRecoveryManager::RecoverObject(const ObjectID &object_id) {
         [this](const ObjectID &object_id, const std::vector<rpc::Address> &locations) {
           PinOrReconstructObject(object_id, locations);
         }));
-  } else {
+  } else if (requires_recovery) {
     RAY_LOG(DEBUG) << "Recovery already started for object " << object_id;
+  } else {
+    RAY_LOG(INFO) << "Object " << object_id
+                  << " has a pinned or spilled location, skipping recovery " << pinned_at;
+    // If the object doesn't exist in the memory store
+    // (core_worker.cc removes the object from memory store before calling this method),
+    // we need to add it back to indicate that it's available.
+    // If the object is already in the memory store then the put is a no-op.
+    RAY_CHECK(
+        in_memory_store_->Put(RayObject(rpc::ErrorType::OBJECT_IN_PLASMA), object_id));
   }
   return true;
 }
@@ -83,7 +98,8 @@ void ObjectRecoveryManager::PinOrReconstructObject(
 }
 
 void ObjectRecoveryManager::PinExistingObjectCopy(
-    const ObjectID &object_id, const rpc::Address &raylet_address,
+    const ObjectID &object_id,
+    const rpc::Address &raylet_address,
     const std::vector<rpc::Address> &other_locations) {
   // If a copy still exists, pin the object by sending a
   // PinObjectIDs RPC.
@@ -100,17 +116,20 @@ void ObjectRecoveryManager::PinExistingObjectCopy(
     if (client_it == remote_object_pinning_clients_.end()) {
       RAY_LOG(DEBUG) << "Connecting to raylet " << node_id;
       client_it = remote_object_pinning_clients_
-                      .emplace(node_id, client_factory_(raylet_address.ip_address(),
-                                                        raylet_address.port()))
+                      .emplace(node_id,
+                               client_factory_(raylet_address.ip_address(),
+                                               raylet_address.port()))
                       .first;
     }
     client = client_it->second;
   }
 
-  client->PinObjectIDs(rpc_address_, {object_id},
+  client->PinObjectIDs(rpc_address_,
+                       {object_id},
+                       /*generator_id=*/ObjectID::Nil(),
                        [this, object_id, other_locations, node_id](
                            const Status &status, const rpc::PinObjectIDsReply &reply) {
-                         if (status.ok()) {
+                         if (status.ok() && reply.successes(0)) {
                            // TODO(swang): Make sure that the node is still alive when
                            // marking the object as pinned.
                            RAY_CHECK(in_memory_store_->Put(
@@ -137,7 +156,8 @@ void ObjectRecoveryManager::ReconstructObject(const ObjectID &object_id) {
                                  rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE_LINEAGE_EVICTED,
                                  /*pin_object=*/true);
     } else {
-      recovery_failure_callback_(object_id, rpc::ErrorType::OBJECT_LOST,
+      recovery_failure_callback_(object_id,
+                                 rpc::ErrorType::OBJECT_LOST,
                                  /*pin_object=*/true);
     }
     return;
@@ -151,6 +171,7 @@ void ObjectRecoveryManager::ReconstructObject(const ObjectID &object_id) {
   auto resubmitted = task_resubmitter_->ResubmitTask(task_id, &task_deps);
 
   if (resubmitted) {
+    reference_counter_->UpdateObjectPendingCreation(object_id, true);
     // Try to recover the task's dependencies.
     for (const auto &dep : task_deps) {
       auto recovered = RecoverObject(dep);
@@ -160,7 +181,8 @@ void ObjectRecoveryManager::ReconstructObject(const ObjectID &object_id) {
         // worker, or if there was a bug in reconstruction that caused us to GC
         // the dependency ref.
         // We do not pin the dependency because we may not be the owner.
-        recovery_failure_callback_(dep, rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE,
+        recovery_failure_callback_(dep,
+                                   rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE,
                                    /*pin_object=*/false);
       }
     }
@@ -168,7 +190,8 @@ void ObjectRecoveryManager::ReconstructObject(const ObjectID &object_id) {
     RAY_LOG(INFO) << "Failed to reconstruct object " << object_id
                   << " because lineage has already been deleted";
     recovery_failure_callback_(
-        object_id, rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED,
+        object_id,
+        rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED,
         /*pin_object=*/true);
   }
 }

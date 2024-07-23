@@ -11,10 +11,14 @@ redis_max_memory = 10**8
 object_store_memory = 10**8
 num_nodes = 1
 
-message = ("Make sure there is enough memory on this machine to run this "
-           "workload. We divide the system memory by 2 to provide a buffer.")
-assert (num_nodes * object_store_memory + num_redis_shards * redis_max_memory <
-        ray._private.utils.get_system_memory() / 2), message
+message = (
+    "Make sure there is enough memory on this machine to run this "
+    "workload. We divide the system memory by 2 to provide a buffer."
+)
+assert (
+    num_nodes * object_store_memory + num_redis_shards * redis_max_memory
+    < ray._private.utils.get_system_memory() / 2
+), message
 
 # Simulate a cluster on one machine.
 
@@ -34,14 +38,15 @@ assert (num_nodes * object_store_memory + num_redis_shards * redis_max_memory <
 if "RAY_ADDRESS" in os.environ:
     del os.environ["RAY_ADDRESS"]
 
-ray.init(num_cpus=10)
+ray.init()
 # Run the workload.
 
+# Whitespace diff to test things.
 run_experiments(
     {
         "impala": {
             "run": "IMPALA",
-            "env": "CartPole-v0",
+            "env": "CartPole-v1",
             "config": {
                 "num_workers": 8,
                 "num_gpus": 0,
@@ -51,6 +56,8 @@ run_experiments(
                 "rollout_fragment_length": 50,
                 "train_batch_size": 100,
             },
+            "storage_path": "/mnt/cluster_storage",
         },
     },
-    callbacks=[ProgressCallback()])
+    callbacks=[ProgressCallback()],
+)

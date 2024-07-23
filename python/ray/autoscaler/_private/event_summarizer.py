@@ -1,6 +1,6 @@
-from typing import Any, Callable, Dict, List
 import time
 from threading import RLock
+from typing import Any, Callable, Dict, List
 
 
 class EventSummarizer:
@@ -18,14 +18,15 @@ class EventSummarizer:
         # by node launcher child threads.
         self.lock = RLock()
 
-    def add(self, template: str, *, quantity: Any,
-            aggregate: Callable[[Any, Any], Any]) -> None:
+    def add(
+        self, template: str, *, quantity: Any, aggregate: Callable[[Any, Any], Any]
+    ) -> None:
         """Add a log message, which will be combined by template.
 
         Args:
-            template (str): Format string with one placeholder for quantity.
-            quantity (Any): Quantity to aggregate.
-            aggregate (func): Aggregation function used to combine the
+            template: Format string with one placeholder for quantity.
+            quantity: Quantity to aggregate.
+            aggregate: Aggregation function used to combine the
                 quantities. The result is inserted into the template to
                 produce the final log message.
         """
@@ -35,7 +36,8 @@ class EventSummarizer:
                 template += "."
             if template in self.events_by_key:
                 self.events_by_key[template] = aggregate(
-                    self.events_by_key[template], quantity)
+                    self.events_by_key[template], quantity
+                )
             else:
                 self.events_by_key[template] = quantity
 
@@ -43,9 +45,9 @@ class EventSummarizer:
         """Add a log message, which is throttled once per interval by a key.
 
         Args:
-            message (str): The message to log.
-            key (str): The key to use to deduplicate the message.
-            interval_s (int): Throttling interval in seconds.
+            message: The message to log.
+            key: The key to use to deduplicate the message.
+            interval_s: Throttling interval in seconds.
         """
         with self.lock:
             if key not in self.throttled_messages:

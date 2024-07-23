@@ -2,13 +2,14 @@ import logging
 from types import ModuleType
 from typing import Any, Dict, List, Optional
 
+from ray.autoscaler._private.command_runner import DockerCommandRunner, SSHCommandRunner
 from ray.autoscaler.command_runner import CommandRunnerInterface
-from ray.autoscaler._private.command_runner import \
-    SSHCommandRunner, DockerCommandRunner
+from ray.util.annotations import DeveloperAPI
 
 logger = logging.getLogger(__name__)
 
 
+@DeveloperAPI
 class NodeProvider:
     """Interface for getting and returning nodes from a Cloud.
 
@@ -26,8 +27,7 @@ class NodeProvider:
     immediately to terminated when `terminate_node` is called.
     """
 
-    def __init__(self, provider_config: Dict[str, Any],
-                 cluster_name: str) -> None:
+    def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
         self.provider_config = provider_config
         self.cluster_name = cluster_name
         self._internal_ip_cache: Dict[str, str] = {}
@@ -44,13 +44,19 @@ class NodeProvider:
         """Return a list of node ids filtered by the specified tags dict.
 
         This list must not include terminated nodes. For performance reasons,
-        providers are allowed to cache the result of a call to nodes() to
-        serve single-node queries (e.g. is_running(node_id)). This means that
-        nodes() must be called again to refresh results.
+        providers are allowed to cache the result of a call to
+        non_terminated_nodes() to serve single-node queries
+        (e.g. is_running(node_id)). This means that non_terminate_nodes() must
+        be called again to refresh results.
 
         Examples:
-            >>> provider.non_terminated_nodes({TAG_RAY_NODE_KIND: "worker"})
+            >>> from ray.autoscaler.node_provider import NodeProvider
+            >>> from ray.autoscaler.tags import TAG_RAY_NODE_KIND
+            >>> provider = NodeProvider(...) # doctest: +SKIP
+            >>> provider.non_terminated_nodes( # doctest: +SKIP
+            ...     {TAG_RAY_NODE_KIND: "worker"})
             ["node-1", "node-2"]
+
         """
         raise NotImplementedError
 
@@ -74,15 +80,14 @@ class NodeProvider:
         """Returns the internal ip (Ray ip) of the given node."""
         raise NotImplementedError
 
-    def get_node_id(self, ip_address: str,
-                    use_internal_ip: bool = False) -> str:
+    def get_node_id(self, ip_address: str, use_internal_ip: bool = False) -> str:
         """Returns the node_id given an IP address.
 
         Assumes ip-address is unique per node.
 
         Args:
-            ip_address (str): Address of node.
-            use_internal_ip (bool): Whether the ip address is
+            ip_address: Address of node.
+            use_internal_ip: Whether the ip address is
                 public or private.
 
         Raises:
@@ -97,42 +102,52 @@ class NodeProvider:
 
         if not find_node_id():
             all_nodes = self.non_terminated_nodes({})
+            ip_func = self.internal_ip if use_internal_ip else self.external_ip
+            ip_cache = (
+                self._internal_ip_cache if use_internal_ip else self._external_ip_cache
+            )
             for node_id in all_nodes:
-                if use_internal_ip:
-                    int_ip = self.internal_ip(node_id)
-                    self._internal_ip_cache[int_ip] = node_id
-                else:
-                    ext_ip = self.external_ip(node_id)
-                    self._external_ip_cache[ext_ip] = node_id
+                ip_cache[ip_func(node_id)] = node_id
 
         if not find_node_id():
             if use_internal_ip:
-                known_msg = (
-                    f"Worker internal IPs: {list(self._internal_ip_cache)}")
+                known_msg = f"Worker internal IPs: {list(self._internal_ip_cache)}"
             else:
-                known_msg = (
-                    f"Worker external IP: {list(self._external_ip_cache)}")
+                known_msg = f"Worker external IP: {list(self._external_ip_cache)}"
             raise ValueError(f"ip {ip_address} not found. " + known_msg)
 
         return find_node_id()
 
-    def create_node(self, node_config: Dict[str, Any], tags: Dict[str, str],
-                    count: int) -> Optional[Dict[str, Any]]:
+    def create_node(
+        self, node_config: Dict[str, Any], tags: Dict[str, str], count: int
+    ) -> Optional[Dict[str, Any]]:
         """Creates a number of nodes within the namespace.
 
         Optionally returns a mapping from created node ids to node metadata.
+
+        Optionally may throw a
+        ray.autoscaler.node_launch_exception.NodeLaunchException which the
+        autoscaler may use to provide additional functionality such as
+        observability.
+
         """
         raise NotImplementedError
 
-    def create_node_with_resources(
-            self, node_config: Dict[str, Any], tags: Dict[str, str],
-            count: int,
-            resources: Dict[str, float]) -> Optional[Dict[str, Any]]:
-        """Create nodes with a given resource config.
+    def create_node_with_resources_and_labels(
+        self,
+        node_config: Dict[str, Any],
+        tags: Dict[str, str],
+        count: int,
+        resources: Dict[str, float],
+        labels: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """Create nodes with a given resource and label config.
 
         This is the method actually called by the autoscaler. Prefer to
         implement this when possible directly, otherwise it delegates to the
         create_node() implementation.
+
+        Optionally may throw a ray.autoscaler.node_launch_exception.NodeLaunchException.
         """
         return self.create_node(node_config, tags, count)
 
@@ -155,8 +170,7 @@ class NodeProvider:
         mapping from deleted node ids to node metadata.
         """
         for node_id in node_ids:
-            logger.info("NodeProvider: "
-                        "{}: Terminating node".format(node_id))
+            logger.info("NodeProvider: {}: Terminating node".format(node_id))
             self.terminate_node(node_id)
         return None
 
@@ -181,29 +195,30 @@ class NodeProvider:
         """Bootstraps the cluster config by adding env defaults if needed."""
         return cluster_config
 
-    def get_command_runner(self,
-                           log_prefix: str,
-                           node_id: str,
-                           auth_config: Dict[str, Any],
-                           cluster_name: str,
-                           process_runner: ModuleType,
-                           use_internal_ip: bool,
-                           docker_config: Optional[Dict[str, Any]] = None
-                           ) -> CommandRunnerInterface:
+    def get_command_runner(
+        self,
+        log_prefix: str,
+        node_id: str,
+        auth_config: Dict[str, Any],
+        cluster_name: str,
+        process_runner: ModuleType,
+        use_internal_ip: bool,
+        docker_config: Optional[Dict[str, Any]] = None,
+    ) -> CommandRunnerInterface:
         """Returns the CommandRunner class used to perform SSH commands.
 
         Args:
-        log_prefix(str): stores "NodeUpdater: {}: ".format(<node_id>). Used
+        log_prefix: stores "NodeUpdater: {}: ".format(<node_id>). Used
             to print progress in the CommandRunner.
-        node_id(str): the node ID.
-        auth_config(dict): the authentication configs from the autoscaler
+        node_id: the node ID.
+        auth_config: the authentication configs from the autoscaler
             yaml file.
-        cluster_name(str): the name of the cluster.
-        process_runner(module): the module to use to run the commands
+        cluster_name: the name of the cluster.
+        process_runner: the module to use to run the commands
             in the CommandRunner. E.g., subprocess.
-        use_internal_ip(bool): whether the node_id belongs to an internal ip
+        use_internal_ip: whether the node_id belongs to an internal ip
             or external ip.
-        docker_config(dict): If set, the docker information of the docker
+        docker_config: If set, the docker information of the docker
             container that commands should be run on.
         """
         common_args = {
@@ -213,20 +228,36 @@ class NodeProvider:
             "auth_config": auth_config,
             "cluster_name": cluster_name,
             "process_runner": process_runner,
-            "use_internal_ip": use_internal_ip
+            "use_internal_ip": use_internal_ip,
         }
         if docker_config and docker_config["container_name"] != "":
             return DockerCommandRunner(docker_config, **common_args)
         else:
             return SSHCommandRunner(**common_args)
 
-    def prepare_for_head_node(
-            self, cluster_config: Dict[str, Any]) -> Dict[str, Any]:
+    def prepare_for_head_node(self, cluster_config: Dict[str, Any]) -> Dict[str, Any]:
         """Returns a new cluster config with custom configs for head node."""
         return cluster_config
 
     @staticmethod
     def fillout_available_node_types_resources(
-            cluster_config: Dict[str, Any]) -> Dict[str, Any]:
+        cluster_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Fills out missing "resources" field for available_node_types."""
         return cluster_config
+
+    def safe_to_scale(self) -> bool:
+        """Optional condition to determine if it's safe to proceed with an autoscaling
+        update. Can be used to wait for convergence of state managed by an external
+        cluster manager.
+
+        Called by the autoscaler immediately after non_terminated_nodes().
+        If False is returned, the autoscaler will abort the update.
+        """
+        return True
+
+    def post_process(self) -> None:
+        """This optional method is executed at the end of
+        StandardAutoscaler._update().
+        """
+        pass

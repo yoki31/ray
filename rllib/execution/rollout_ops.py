@@ -1,283 +1,192 @@
 import logging
-from typing import List, Tuple
-import time
+from typing import List, Optional, Union
+import tree
 
-import ray
-from ray.util.iter import from_actors, LocalIterator
-from ray.util.iter_metrics import SharedMetrics
-from ray.rllib.evaluation.rollout_worker import get_global_worker
-from ray.rllib.evaluation.worker_set import WorkerSet
-from ray.rllib.execution.common import AGENT_STEPS_SAMPLED_COUNTER, \
-    STEPS_SAMPLED_COUNTER, SAMPLE_TIMER, GRAD_WAIT_TIMER, \
-    _check_sample_batch_type, _get_shared_metrics
-from ray.rllib.policy.sample_batch import SampleBatch, DEFAULT_POLICY_ID, \
-    MultiAgentBatch
-from ray.rllib.utils.metrics.learner_info import LEARNER_INFO, \
-    LEARNER_STATS_KEY
+from ray.rllib.env.env_runner_group import EnvRunnerGroup
+from ray.rllib.policy.sample_batch import (
+    SampleBatch,
+    DEFAULT_POLICY_ID,
+    concat_samples,
+)
+from ray.rllib.utils.annotations import ExperimentalAPI, OldAPIStack
+from ray.rllib.utils.metrics import NUM_AGENT_STEPS_SAMPLED, NUM_ENV_STEPS_SAMPLED
 from ray.rllib.utils.sgd import standardized
-from ray.rllib.utils.typing import PolicyID, SampleBatchType, ModelGradients
+from ray.rllib.utils.typing import EpisodeType, SampleBatchType
 
 logger = logging.getLogger(__name__)
 
 
-def synchronous_parallel_sample(workers: WorkerSet) -> List[SampleBatch]:
-    # No remote workers in the set -> Use local worker for collecting
-    # samples.
-    if not workers.remote_workers():
-        return [workers.local_worker().sample()]
+@ExperimentalAPI
+def synchronous_parallel_sample(
+    *,
+    worker_set: EnvRunnerGroup,
+    max_agent_steps: Optional[int] = None,
+    max_env_steps: Optional[int] = None,
+    concat: bool = True,
+    sample_timeout_s: Optional[float] = None,
+    random_actions: bool = False,
+    _uses_new_env_runners: bool = False,
+    _return_metrics: bool = False,
+) -> Union[List[SampleBatchType], SampleBatchType, List[EpisodeType], EpisodeType]:
+    """Runs parallel and synchronous rollouts on all remote workers.
 
-    # Loop over remote workers' `sample()` method in parallel.
-    sample_batches = ray.get(
-        [r.sample.remote() for r in workers.remote_workers()])
+    Waits for all workers to return from the remote calls.
 
-    return sample_batches
+    If no remote workers exist (num_workers == 0), use the local worker
+    for sampling.
 
-
-def ParallelRollouts(workers: WorkerSet, *, mode="bulk_sync",
-                     num_async=1) -> LocalIterator[SampleBatch]:
-    """Operator to collect experiences in parallel from rollout workers.
-
-    If there are no remote workers, experiences will be collected serially from
-    the local worker instance instead.
-
-    Args:
-        workers (WorkerSet): set of rollout workers to use.
-        mode (str): One of 'async', 'bulk_sync', 'raw'. In 'async' mode,
-            batches are returned as soon as they are computed by rollout
-            workers with no order guarantees. In 'bulk_sync' mode, we collect
-            one batch from each worker and concatenate them together into a
-            large batch to return. In 'raw' mode, the ParallelIterator object
-            is returned directly and the caller is responsible for implementing
-            gather and updating the timesteps counter.
-        num_async (int): In async mode, the max number of async
-            requests in flight per actor.
-
-    Returns:
-        A local iterator over experiences collected in parallel.
-
-    Examples:
-        >>> rollouts = ParallelRollouts(workers, mode="async")
-        >>> batch = next(rollouts)
-        >>> print(batch.count)
-        50  # config.rollout_fragment_length
-
-        >>> rollouts = ParallelRollouts(workers, mode="bulk_sync")
-        >>> batch = next(rollouts)
-        >>> print(batch.count)
-        200  # config.rollout_fragment_length * config.num_workers
-
-    Updates the STEPS_SAMPLED_COUNTER counter in the local iterator context.
-    """
-
-    # Ensure workers are initially in sync.
-    workers.sync_weights()
-
-    def report_timesteps(batch):
-        metrics = _get_shared_metrics()
-        metrics.counters[STEPS_SAMPLED_COUNTER] += batch.count
-        if isinstance(batch, MultiAgentBatch):
-            metrics.counters[AGENT_STEPS_SAMPLED_COUNTER] += \
-                batch.agent_steps()
-        else:
-            metrics.counters[AGENT_STEPS_SAMPLED_COUNTER] += batch.count
-        return batch
-
-    if not workers.remote_workers():
-        # Handle the `num_workers=0` case, in which the local worker
-        # has to do sampling as well.
-        def sampler(_):
-            while True:
-                yield workers.local_worker().sample()
-
-        return (LocalIterator(sampler,
-                              SharedMetrics()).for_each(report_timesteps))
-
-    # Create a parallel iterator over generated experiences.
-    rollouts = from_actors(workers.remote_workers())
-
-    if mode == "bulk_sync":
-        return rollouts \
-            .batch_across_shards() \
-            .for_each(lambda batches: SampleBatch.concat_samples(batches)) \
-            .for_each(report_timesteps)
-    elif mode == "async":
-        return rollouts.gather_async(
-            num_async=num_async).for_each(report_timesteps)
-    elif mode == "raw":
-        return rollouts
-    else:
-        raise ValueError("mode must be one of 'bulk_sync', 'async', 'raw', "
-                         "got '{}'".format(mode))
-
-
-def AsyncGradients(
-        workers: WorkerSet) -> LocalIterator[Tuple[ModelGradients, int]]:
-    """Operator to compute gradients in parallel from rollout workers.
+    Alternatively to calling `worker.sample.remote()`, the user can provide a
+    `remote_fn()`, which will be applied to the worker(s) instead.
 
     Args:
-        workers (WorkerSet): set of rollout workers to use.
+        worker_set: The EnvRunnerGroup to use for sampling.
+        remote_fn: If provided, use `worker.apply.remote(remote_fn)` instead
+            of `worker.sample.remote()` to generate the requests.
+        max_agent_steps: Optional number of agent steps to be included in the
+            final batch or list of episodes.
+        max_env_steps: Optional number of environment steps to be included in the
+            final batch or list of episodes.
+        concat: Whether to aggregate all resulting batches or episodes. in case of
+            batches the list of batches is concatinated at the end. in case of
+            episodes all episode lists from workers are flattened into a single list.
+        sample_timeout_s: The timeout in sec to use on the `foreach_worker` call.
+            After this time, the call will return with a result (or not if all workers
+            are stalling). If None, will block indefinitely and not timeout.
+        _uses_new_env_runners: Whether the new `EnvRunner API` is used. In this case
+            episodes instead of `SampleBatch` objects are returned.
 
     Returns:
-        A local iterator over policy gradients computed on rollout workers.
+        The list of collected sample batch types or episode types (one for each parallel
+        rollout worker in the given `worker_set`).
 
-    Examples:
-        >>> grads_op = AsyncGradients(workers)
-        >>> print(next(grads_op))
-        {"var_0": ..., ...}, 50  # grads, batch count
+    .. testcode::
 
-    Updates the STEPS_SAMPLED_COUNTER counter and LEARNER_INFO field in the
-    local iterator context.
+        # Define an RLlib Algorithm.
+        from ray.rllib.algorithms.ppo import PPO, PPOConfig
+        config = PPOConfig().environment("CartPole-v1")
+        algorithm = PPO(config=config)
+        # 2 remote workers (num_workers=2):
+        batches = synchronous_parallel_sample(worker_set=algorithm.env_runner_group,
+            concat=False)
+        print(len(batches))
+
+    .. testoutput::
+
+        2
     """
+    # Only allow one of `max_agent_steps` or `max_env_steps` to be defined.
+    assert not (max_agent_steps is not None and max_env_steps is not None)
 
-    # Ensure workers are initially in sync.
-    workers.sync_weights()
+    agent_or_env_steps = 0
+    max_agent_or_env_steps = max_agent_steps or max_env_steps or None
+    sample_batches_or_episodes = []
+    all_stats_dicts = []
 
-    # This function will be applied remotely on the workers.
-    def samples_to_grads(samples):
-        return get_global_worker().compute_gradients(samples), samples.count
+    random_action_kwargs = {} if not random_actions else {"random_actions": True}
 
-    # Record learner metrics and pass through (grads, count).
-    class record_metrics:
-        def _on_fetch_start(self):
-            self.fetch_start_time = time.perf_counter()
-
-        def __call__(self, item):
-            (grads, info), count = item
-            metrics = _get_shared_metrics()
-            metrics.counters[STEPS_SAMPLED_COUNTER] += count
-            metrics.info[LEARNER_INFO] = {
-                DEFAULT_POLICY_ID: info
-            } if LEARNER_STATS_KEY in info else info
-            metrics.timers[GRAD_WAIT_TIMER].push(time.perf_counter() -
-                                                 self.fetch_start_time)
-            return grads, count
-
-    rollouts = from_actors(workers.remote_workers())
-    grads = rollouts.for_each(samples_to_grads)
-    return grads.gather_async().for_each(record_metrics())
-
-
-class ConcatBatches:
-    """Callable used to merge batches into larger batches for training.
-
-    This should be used with the .combine() operator.
-
-    Examples:
-        >>> rollouts = ParallelRollouts(...)
-        >>> rollouts = rollouts.combine(ConcatBatches(
-        ...    min_batch_size=10000, count_steps_by="env_steps"))
-        >>> print(next(rollouts).count)
-        10000
-    """
-
-    def __init__(self, min_batch_size: int, count_steps_by: str = "env_steps"):
-        self.min_batch_size = min_batch_size
-        self.count_steps_by = count_steps_by
-        self.buffer = []
-        self.count = 0
-        self.last_batch_time = time.perf_counter()
-
-    def __call__(self, batch: SampleBatchType) -> List[SampleBatchType]:
-        _check_sample_batch_type(batch)
-
-        if self.count_steps_by == "env_steps":
-            size = batch.count
+    # Stop collecting batches as soon as one criterium is met.
+    while (max_agent_or_env_steps is None and agent_or_env_steps == 0) or (
+        max_agent_or_env_steps is not None
+        and agent_or_env_steps < max_agent_or_env_steps
+    ):
+        # No remote workers in the set -> Use local worker for collecting
+        # samples.
+        if worker_set.num_remote_workers() <= 0:
+            sampled_data = [worker_set.local_env_runner.sample(**random_action_kwargs)]
+            if _return_metrics:
+                stats_dicts = [worker_set.local_env_runner.get_metrics()]
+        # Loop over remote workers' `sample()` method in parallel.
         else:
-            assert isinstance(batch, MultiAgentBatch), \
-                "`count_steps_by=agent_steps` only allowed in multi-agent " \
-                "environments!"
-            size = batch.agent_steps()
+            sampled_data = worker_set.foreach_worker(
+                (
+                    (lambda w: w.sample(**random_action_kwargs))
+                    if not _return_metrics
+                    else (lambda w: (w.sample(**random_action_kwargs), w.get_metrics()))
+                ),
+                local_env_runner=False,
+                timeout_seconds=sample_timeout_s,
+            )
+            # Nothing was returned (maybe all workers are stalling) or no healthy
+            # remote workers left: Break.
+            # There is no point staying in this loop, since we will not be able to
+            # get any new samples if we don't have any healthy remote workers left.
+            if not sampled_data or worker_set.num_healthy_remote_workers() <= 0:
+                if not sampled_data:
+                    logger.warning(
+                        "No samples returned from remote workers. If you have a "
+                        "slow environment or model, consider increasing the "
+                        "`sample_timeout_s` or decreasing the "
+                        "`rollout_fragment_length` in `AlgorithmConfig.env_runners()."
+                    )
+                elif worker_set.num_healthy_remote_workers() <= 0:
+                    logger.warning(
+                        "No healthy remote workers left. Trying to restore workers ..."
+                    )
+                break
 
-        # Incoming batch is an empty dummy batch -> Ignore.
-        # Possibly produced automatically by a PolicyServer to unblock
-        # an external env waiting for inputs from unresponsive/disconnected
-        # client(s).
-        if size == 0:
-            return []
+            if _return_metrics:
+                stats_dicts = [s[1] for s in sampled_data]
+                sampled_data = [s[0] for s in sampled_data]
 
-        self.count += size
-        self.buffer.append(batch)
+        # Update our counters for the stopping criterion of the while loop.
+        if _return_metrics:
+            if max_agent_steps:
+                agent_or_env_steps += sum(
+                    int(agent_stat)
+                    for stat_dict in stats_dicts
+                    for agent_stat in stat_dict[NUM_AGENT_STEPS_SAMPLED].values()
+                )
+            else:
+                agent_or_env_steps += sum(
+                    int(stat_dict[NUM_ENV_STEPS_SAMPLED]) for stat_dict in stats_dicts
+                )
+        else:
+            for batch_or_episode in sampled_data:
+                if max_agent_steps:
+                    agent_or_env_steps += (
+                        sum(e.agent_steps() for e in batch_or_episode)
+                        if _uses_new_env_runners
+                        else batch_or_episode.agent_steps()
+                    )
+                else:
+                    agent_or_env_steps += (
+                        sum(e.env_steps() for e in batch_or_episode)
+                        if _uses_new_env_runners
+                        else batch_or_episode.env_steps()
+                    )
+        sample_batches_or_episodes.extend(sampled_data)
+        if _return_metrics:
+            all_stats_dicts.extend(stats_dicts)
 
-        if self.count >= self.min_batch_size:
-            if self.count > self.min_batch_size * 2:
-                logger.info("Collected more training samples than expected "
-                            "(actual={}, expected={}). ".format(
-                                self.count, self.min_batch_size) +
-                            "This may be because you have many workers or "
-                            "long episodes in 'complete_episodes' batch mode.")
-            out = SampleBatch.concat_samples(self.buffer)
+    if concat is True:
+        # If we have episodes flatten the episode list.
+        if _uses_new_env_runners:
+            sample_batches_or_episodes = tree.flatten(sample_batches_or_episodes)
+        # Otherwise we concatenate the `SampleBatch` objects
+        else:
+            sample_batches_or_episodes = concat_samples(sample_batches_or_episodes)
 
-            perf_counter = time.perf_counter()
-            timer = _get_shared_metrics().timers[SAMPLE_TIMER]
-            timer.push(perf_counter - self.last_batch_time)
-            timer.push_units_processed(self.count)
-
-            self.last_batch_time = perf_counter
-            self.buffer = []
-            self.count = 0
-            return [out]
-        return []
-
-
-class SelectExperiences:
-    """Callable used to select experiences from a MultiAgentBatch.
-
-    This should be used with the .for_each() operator.
-
-    Examples:
-        >>> rollouts = ParallelRollouts(...)
-        >>> rollouts = rollouts.for_each(SelectExperiences(["pol1", "pol2"]))
-        >>> print(next(rollouts).policy_batches.keys())
-        {"pol1", "pol2"}
-    """
-
-    def __init__(self, policy_ids: List[PolicyID]):
-        assert isinstance(policy_ids, list), policy_ids
-        self.policy_ids = policy_ids
-
-    def __call__(self, samples: SampleBatchType) -> SampleBatchType:
-        _check_sample_batch_type(samples)
-
-        if isinstance(samples, MultiAgentBatch):
-            samples = MultiAgentBatch({
-                k: v
-                for k, v in samples.policy_batches.items()
-                if k in self.policy_ids
-            }, samples.count)
-
-        return samples
+    if _return_metrics:
+        return sample_batches_or_episodes, all_stats_dicts
+    return sample_batches_or_episodes
 
 
-class StandardizeFields:
-    """Callable used to standardize fields of batches.
+@OldAPIStack
+def standardize_fields(samples: SampleBatchType, fields: List[str]) -> SampleBatchType:
+    """Standardize fields of the given SampleBatch"""
+    wrapped = False
 
-    This should be used with the .for_each() operator. Note that the input
-    may be mutated by this operator for efficiency.
+    if isinstance(samples, SampleBatch):
+        samples = samples.as_multi_agent()
+        wrapped = True
 
-    Examples:
-        >>> rollouts = ParallelRollouts(...)
-        >>> rollouts = rollouts.for_each(StandardizeFields(["advantages"]))
-        >>> print(np.std(next(rollouts)["advantages"]))
-        1.0
-    """
-
-    def __init__(self, fields: List[str]):
-        self.fields = fields
-
-    def __call__(self, samples: SampleBatchType) -> SampleBatchType:
-        _check_sample_batch_type(samples)
-        wrapped = False
-
-        if isinstance(samples, SampleBatch):
-            samples = samples.as_multi_agent()
-            wrapped = True
-
-        for policy_id in samples.policy_batches:
-            batch = samples.policy_batches[policy_id]
-            for field in self.fields:
+    for policy_id in samples.policy_batches:
+        batch = samples.policy_batches[policy_id]
+        for field in fields:
+            if field in batch:
                 batch[field] = standardized(batch[field])
 
-        if wrapped:
-            samples = samples.policy_batches[DEFAULT_POLICY_ID]
+    if wrapped:
+        samples = samples.policy_batches[DEFAULT_POLICY_ID]
 
-        return samples
+    return samples

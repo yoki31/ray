@@ -36,6 +36,19 @@
 #include "src/ray/protobuf/core_worker.grpc.pb.h"
 #include "src/ray/protobuf/core_worker.pb.h"
 
+namespace std {
+template <>
+struct hash<ray::rpc::Address> {
+  size_t operator()(const ray::rpc::Address &addr) const {
+    size_t hash = std::hash<int32_t>()(addr.port());
+    hash ^= std::hash<std::string>()(addr.ip_address());
+    hash ^= std::hash<std::string>()(addr.worker_id());
+    hash ^= std::hash<std::string>()(addr.raylet_id());
+    return hash;
+  }
+};
+}  // namespace std
+
 namespace ray {
 namespace rpc {
 
@@ -57,42 +70,9 @@ const static int64_t RequestSizeInBytes(const PushTaskRequest &request) {
 // Shared between direct actor and task submitters.
 /* class CoreWorkerClientInterface; */
 
-// TODO(swang): Remove and replace with rpc::Address.
-class WorkerAddress {
- public:
-  WorkerAddress(const rpc::Address &address)
-      : ip_address(address.ip_address()),
-        port(address.port()),
-        worker_id(WorkerID::FromBinary(address.worker_id())),
-        raylet_id(NodeID::FromBinary(address.raylet_id())) {}
-  template <typename H>
-  friend H AbslHashValue(H h, const WorkerAddress &w) {
-    return H::combine(std::move(h), w.ip_address, w.port, w.worker_id, w.raylet_id);
-  }
-
-  bool operator==(const WorkerAddress &other) const {
-    return other.ip_address == ip_address && other.port == port &&
-           other.worker_id == worker_id && other.raylet_id == raylet_id;
-  }
-
-  rpc::Address ToProto() const {
-    rpc::Address addr;
-    addr.set_raylet_id(raylet_id.Binary());
-    addr.set_ip_address(ip_address);
-    addr.set_port(port);
-    addr.set_worker_id(worker_id.Binary());
-    return addr;
-  }
-
-  /// The ip address of the worker.
-  const std::string ip_address;
-  /// The local port of the worker.
-  const int port;
-  /// The unique id of the worker.
-  const WorkerID worker_id;
-  /// The unique id of the worker raylet.
-  const NodeID raylet_id;
-};
+inline bool operator==(const rpc::Address &lhs, const rpc::Address &rhs) {
+  return google::protobuf::util::MessageDifferencer::Equivalent(lhs, rhs);
+}
 
 /// Abstract client interface for testing.
 class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
@@ -102,6 +82,8 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
     return empty_addr_;
   }
 
+  virtual bool IsChannelIdleAfterRPCs() const { return false; }
+
   /// Push an actor task directly from worker to worker.
   ///
   /// \param[in] request The request message.
@@ -109,7 +91,8 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
   /// task for execution immediately.
   /// \param[in] callback The callback function that handles reply.
   /// \return if the rpc call succeeds
-  virtual void PushActorTask(std::unique_ptr<PushTaskRequest> request, bool skip_queue,
+  virtual void PushActorTask(std::unique_ptr<PushTaskRequest> request,
+                             bool skip_queue,
                              const ClientCallback<PushTaskReply> &callback) {}
 
   /// Similar to PushActorTask, but sets no ordering constraint. This is used to
@@ -117,8 +100,14 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
   virtual void PushNormalTask(std::unique_ptr<PushTaskRequest> request,
                               const ClientCallback<PushTaskReply> &callback) {}
 
-  virtual void StealTasks(const StealTasksRequest &request,
-                          const ClientCallback<StealTasksReply> &callback) {}
+  /// Get the number of pending tasks for this worker.
+  ///
+  /// \param[in] request The request message.
+  /// \param[in] callback The callback function that handles reply.
+  /// \return if the rpc call succeeds
+  virtual void NumPendingTasks(std::unique_ptr<NumPendingTasksRequest> request,
+                               const ClientCallback<NumPendingTasksReply> &callback,
+                               int64_t timeout_ms = -1) {}
 
   /// Notify a wait has completed for direct actor call arguments.
   ///
@@ -156,6 +145,10 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
       const GetObjectLocationsOwnerRequest &request,
       const ClientCallback<GetObjectLocationsOwnerReply> &callback) {}
 
+  virtual void ReportGeneratorItemReturns(
+      const ReportGeneratorItemReturnsRequest &request,
+      const ClientCallback<ReportGeneratorItemReturnsReply> &callback) {}
+
   /// Tell this actor to exit immediately.
   virtual void KillActor(const KillActorRequest &request,
                          const ClientCallback<KillActorReply> &callback) {}
@@ -166,12 +159,19 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
   virtual void RemoteCancelTask(const RemoteCancelTaskRequest &request,
                                 const ClientCallback<RemoteCancelTaskReply> &callback) {}
 
+  virtual void RegisterMutableObjectReader(
+      const RegisterMutableObjectReaderRequest &request,
+      const ClientCallback<RegisterMutableObjectReaderReply> &callback) {}
+
   virtual void GetCoreWorkerStats(
       const GetCoreWorkerStatsRequest &request,
       const ClientCallback<GetCoreWorkerStatsReply> &callback) {}
 
   virtual void LocalGC(const LocalGCRequest &request,
                        const ClientCallback<LocalGCReply> &callback) {}
+
+  virtual void DeleteObjects(const DeleteObjectsRequest &request,
+                             const ClientCallback<DeleteObjectsReply> &callback) {}
 
   virtual void SpillObjects(const SpillObjectsRequest &request,
                             const ClientCallback<SpillObjectsReply> &callback) {}
@@ -184,9 +184,6 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
       const DeleteSpilledObjectsRequest &request,
       const ClientCallback<DeleteSpilledObjectsReply> &callback) {}
 
-  virtual void AddSpilledUrl(const AddSpilledUrlRequest &request,
-                             const ClientCallback<AddSpilledUrlReply> &callback) {}
-
   virtual void PlasmaObjectReady(const PlasmaObjectReadyRequest &request,
                                  const ClientCallback<PlasmaObjectReadyReply> &callback) {
   }
@@ -197,6 +194,10 @@ class CoreWorkerClientInterface : public pubsub::SubscriberClientInterface {
   virtual void AssignObjectOwner(const AssignObjectOwnerRequest &request,
                                  const ClientCallback<AssignObjectOwnerReply> &callback) {
   }
+
+  virtual void RayletNotifyGCSRestart(
+      const RayletNotifyGCSRestartRequest &request,
+      const ClientCallback<RayletNotifyGCSRestartReply> &callback) {}
 
   /// Returns the max acked sequence number, useful for checking on progress.
   virtual int64_t ClientProcessedUpToSeqno() { return -1; }
@@ -211,7 +212,6 @@ class CoreWorkerClient : public std::enable_shared_from_this<CoreWorkerClient>,
   /// Constructor.
   ///
   /// \param[in] address Address of the worker server.
-  /// \param[in] port Port of the worker server.
   /// \param[in] client_call_manager The `ClientCallManager` used for managing requests.
   CoreWorkerClient(const rpc::Address &address, ClientCallManager &client_call_manager)
       : addr_(address) {
@@ -221,74 +221,152 @@ class CoreWorkerClient : public std::enable_shared_from_this<CoreWorkerClient>,
 
   const rpc::Address &Addr() const override { return addr_; }
 
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, DirectActorCallArgWaitComplete, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
+  bool IsChannelIdleAfterRPCs() const override {
+    return grpc_client_->IsChannelIdleAfterRPCs();
+  }
 
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, GetObjectStatus, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, KillActor, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, CancelTask, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, RemoteCancelTask, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, WaitForActorOutOfScope, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, PubsubLongPolling, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, PubsubCommandBatch, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, UpdateObjectLocationBatch, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, GetObjectLocationsOwner, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, GetCoreWorkerStats, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, LocalGC, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, SpillObjects, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, RestoreSpilledObjects, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, DeleteSpilledObjects, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, AddSpilledUrl, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, PlasmaObjectReady, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
-
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, Exit, grpc_client_, /*method_timeout_ms*/ -1,
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         DirectActorCallArgWaitComplete,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
                          override)
 
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, AssignObjectOwner, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         GetObjectStatus,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
 
-  VOID_RPC_CLIENT_METHOD(CoreWorkerService, StealTasks, grpc_client_,
-                         /*method_timeout_ms*/ -1, override)
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         KillActor,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
 
-  void PushActorTask(std::unique_ptr<PushTaskRequest> request, bool skip_queue,
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         CancelTask,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         RemoteCancelTask,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         WaitForActorOutOfScope,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         PubsubLongPolling,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         PubsubCommandBatch,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         UpdateObjectLocationBatch,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         GetObjectLocationsOwner,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         ReportGeneratorItemReturns,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         RegisterMutableObjectReader,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         GetCoreWorkerStats,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         LocalGC,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         DeleteObjects,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         SpillObjects,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         RestoreSpilledObjects,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         DeleteSpilledObjects,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         PlasmaObjectReady,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         RayletNotifyGCSRestart,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  VOID_RPC_CLIENT_METHOD(
+      CoreWorkerService, Exit, grpc_client_, /*method_timeout_ms*/ -1, override)
+
+  VOID_RPC_CLIENT_METHOD(CoreWorkerService,
+                         AssignObjectOwner,
+                         grpc_client_,
+                         /*method_timeout_ms*/ -1,
+                         override)
+
+  void PushActorTask(std::unique_ptr<PushTaskRequest> request,
+                     bool skip_queue,
                      const ClientCallback<PushTaskReply> &callback) override {
     if (skip_queue) {
       // Set this value so that the actor does not skip any tasks when
       // processing this request. We could also set it to max_finished_seq_no_,
       // but we just set it to the default of -1 to avoid taking the lock.
       request->set_client_processed_up_to(-1);
-      INVOKE_RPC_CALL(CoreWorkerService, PushTask, *request, callback, grpc_client_,
+      INVOKE_RPC_CALL(CoreWorkerService,
+                      PushTask,
+                      *request,
+                      callback,
+                      grpc_client_,
                       /*method_timeout_ms*/ -1);
       return;
     }
@@ -306,8 +384,19 @@ class CoreWorkerClient : public std::enable_shared_from_this<CoreWorkerClient>,
                       const ClientCallback<PushTaskReply> &callback) override {
     request->set_sequence_number(-1);
     request->set_client_processed_up_to(-1);
-    INVOKE_RPC_CALL(CoreWorkerService, PushTask, *request, callback, grpc_client_,
+    INVOKE_RPC_CALL(CoreWorkerService,
+                    PushTask,
+                    *request,
+                    callback,
+                    grpc_client_,
                     /*method_timeout_ms*/ -1);
+  }
+
+  void NumPendingTasks(std::unique_ptr<NumPendingTasksRequest> request,
+                       const ClientCallback<NumPendingTasksReply> &callback,
+                       int64_t timeout_ms = -1) override {
+    INVOKE_RPC_CALL(
+        CoreWorkerService, NumPendingTasks, *request, callback, grpc_client_, timeout_ms);
   }
 
   /// Send as many pending tasks as possible. This method is thread-safe.
@@ -329,23 +418,26 @@ class CoreWorkerClient : public std::enable_shared_from_this<CoreWorkerClient>,
       request->set_client_processed_up_to(max_finished_seq_no_);
       rpc_bytes_in_flight_ += task_size;
 
-      auto rpc_callback = [this, this_ptr, seq_no, task_size,
-                           callback = std::move(pair.second)](
-                              Status status, const rpc::PushTaskReply &reply) {
-        {
-          absl::MutexLock lock(&mutex_);
-          if (seq_no > max_finished_seq_no_) {
-            max_finished_seq_no_ = seq_no;
-          }
-          rpc_bytes_in_flight_ -= task_size;
-          RAY_CHECK(rpc_bytes_in_flight_ >= 0);
-        }
-        SendRequests();
-        callback(status, reply);
-      };
+      auto rpc_callback =
+          [this, this_ptr, seq_no, task_size, callback = std::move(pair.second)](
+              Status status, const rpc::PushTaskReply &reply) {
+            {
+              absl::MutexLock lock(&mutex_);
+              if (seq_no > max_finished_seq_no_) {
+                max_finished_seq_no_ = seq_no;
+              }
+              rpc_bytes_in_flight_ -= task_size;
+              RAY_CHECK(rpc_bytes_in_flight_ >= 0);
+            }
+            SendRequests();
+            callback(status, reply);
+          };
 
-      RAY_UNUSED(INVOKE_RPC_CALL(CoreWorkerService, PushTask, *request,
-                                 std::move(rpc_callback), grpc_client_,
+      RAY_UNUSED(INVOKE_RPC_CALL(CoreWorkerService,
+                                 PushTask,
+                                 *request,
+                                 std::move(rpc_callback),
+                                 grpc_client_,
                                  /*method_timeout_ms*/ -1));
     }
 
@@ -372,13 +464,13 @@ class CoreWorkerClient : public std::enable_shared_from_this<CoreWorkerClient>,
 
   /// Queue of requests to send.
   std::deque<std::pair<std::unique_ptr<PushTaskRequest>, ClientCallback<PushTaskReply>>>
-      send_queue_ GUARDED_BY(mutex_);
+      send_queue_ ABSL_GUARDED_BY(mutex_);
 
   /// The number of bytes currently in flight.
-  int64_t rpc_bytes_in_flight_ GUARDED_BY(mutex_) = 0;
+  int64_t rpc_bytes_in_flight_ ABSL_GUARDED_BY(mutex_) = 0;
 
   /// The max sequence number we have processed responses for.
-  int64_t max_finished_seq_no_ GUARDED_BY(mutex_) = -1;
+  int64_t max_finished_seq_no_ ABSL_GUARDED_BY(mutex_) = -1;
 };
 
 typedef std::function<std::shared_ptr<CoreWorkerClientInterface>(const rpc::Address &)>

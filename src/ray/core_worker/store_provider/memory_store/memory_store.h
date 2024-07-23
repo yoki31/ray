@@ -31,7 +31,7 @@ namespace core {
 struct MemoryStoreStats {
   int32_t num_in_plasma = 0;
   int32_t num_local_objects = 0;
-  int64_t used_object_store_memory = 0;
+  int64_t num_local_objects_bytes = 0;
 };
 
 class GetRequest;
@@ -51,7 +51,10 @@ class CoreWorkerMemoryStore {
       std::shared_ptr<ReferenceCounter> counter = nullptr,
       std::shared_ptr<raylet::RayletClient> raylet_client = nullptr,
       std::function<Status()> check_signals = nullptr,
-      std::function<void(const RayObject &)> unhandled_exception_handler = nullptr);
+      std::function<void(const RayObject &)> unhandled_exception_handler = nullptr,
+      std::function<std::shared_ptr<RayObject>(const RayObject &object,
+                                               const ObjectID &object_id)>
+          object_allocator = nullptr);
   ~CoreWorkerMemoryStore(){};
 
   /// Put an object with specified ID into object store.
@@ -72,19 +75,25 @@ class CoreWorkerMemoryStore {
   /// finishes. This has no effect if ref counting is enabled.
   /// \param[out] results Result list of objects data.
   /// \return Status.
-  Status Get(const std::vector<ObjectID> &object_ids, int num_objects, int64_t timeout_ms,
-             const WorkerContext &ctx, bool remove_after_get,
+  Status Get(const std::vector<ObjectID> &object_ids,
+             int num_objects,
+             int64_t timeout_ms,
+             const WorkerContext &ctx,
+             bool remove_after_get,
              std::vector<std::shared_ptr<RayObject>> *results);
 
   /// Convenience wrapper around Get() that stores results in a given result map.
-  Status Get(const absl::flat_hash_set<ObjectID> &object_ids, int64_t timeout_ms,
+  Status Get(const absl::flat_hash_set<ObjectID> &object_ids,
+             int64_t timeout_ms,
              const WorkerContext &ctx,
              absl::flat_hash_map<ObjectID, std::shared_ptr<RayObject>> *results,
              bool *got_exception);
 
   /// Convenience wrapper around Get() that stores ready objects in a given result set.
-  Status Wait(const absl::flat_hash_set<ObjectID> &object_ids, int num_objects,
-              int64_t timeout_ms, const WorkerContext &ctx,
+  Status Wait(const absl::flat_hash_set<ObjectID> &object_ids,
+              int num_objects,
+              int64_t timeout_ms,
+              const WorkerContext &ctx,
               absl::flat_hash_set<ObjectID> *ready);
 
   /// Get an object if it exists.
@@ -154,14 +163,20 @@ class CoreWorkerMemoryStore {
   /// never trigger the deletion hook for task errors that prints them.
   void NotifyUnhandledErrors();
 
+  /// Record CoreWorker heap memory related metrics.
+  void RecordMetrics();
+
  private:
   FRIEND_TEST(TestMemoryStore, TestMemoryStoreStats);
 
   /// See the public version of `Get` for meaning of the other arguments.
   /// \param[in] abort_if_any_object_is_exception Whether we should abort if any object
   /// resources. is an exception.
-  Status GetImpl(const std::vector<ObjectID> &object_ids, int num_objects,
-                 int64_t timeout_ms, const WorkerContext &ctx, bool remove_after_get,
+  Status GetImpl(const std::vector<ObjectID> &object_ids,
+                 int num_objects,
+                 int64_t timeout_ms,
+                 const WorkerContext &ctx,
+                 bool remove_after_get,
                  std::vector<std::shared_ptr<RayObject>> *results,
                  bool abort_if_any_object_is_exception);
 
@@ -171,11 +186,12 @@ class CoreWorkerMemoryStore {
   /// Emplace the given object entry to the in-memory-store and update stats properly.
   void EmplaceObjectAndUpdateStats(const ObjectID &object_id,
                                    std::shared_ptr<RayObject> &object_entry)
-      EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Erase the object of the object id from the in memory store and update stats
   /// properly.
-  void EraseObjectAndUpdateStats(const ObjectID &object_id) EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void EraseObjectAndUpdateStats(const ObjectID &object_id)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// If enabled, holds a reference to local worker ref counter. TODO(ekl) make this
   /// mandatory once Java is supported.
@@ -190,16 +206,16 @@ class CoreWorkerMemoryStore {
   /// Map from object ID to `RayObject`.
   /// NOTE: This map should be modified by EmplaceObjectAndUpdateStats and
   /// EraseObjectAndUpdateStats.
-  absl::flat_hash_map<ObjectID, std::shared_ptr<RayObject>> objects_ GUARDED_BY(mu_);
+  absl::flat_hash_map<ObjectID, std::shared_ptr<RayObject>> objects_ ABSL_GUARDED_BY(mu_);
 
   /// Map from object ID to its get requests.
   absl::flat_hash_map<ObjectID, std::vector<std::shared_ptr<GetRequest>>>
-      object_get_requests_ GUARDED_BY(mu_);
+      object_get_requests_ ABSL_GUARDED_BY(mu_);
 
   /// Map from object ID to its async get requests.
   absl::flat_hash_map<ObjectID,
                       std::vector<std::function<void(std::shared_ptr<RayObject>)>>>
-      object_async_get_requests_ GUARDED_BY(mu_);
+      object_async_get_requests_ ABSL_GUARDED_BY(mu_);
 
   /// Function passed in to be called to check for signals (e.g., Ctrl-C).
   std::function<Status()> check_signals_;
@@ -211,12 +227,19 @@ class CoreWorkerMemoryStore {
   /// Below information is stats.
   ///
   /// Number of objects in the plasma store for this memory store.
-  int32_t num_in_plasma_ GUARDED_BY(mu_) = 0;
+  int32_t num_in_plasma_ ABSL_GUARDED_BY(mu_) = 0;
   /// Number of objects that don't exist in the plasma store.
-  int32_t num_local_objects_ GUARDED_BY(mu_) = 0;
-  /// Number of object store memory used by this memory store. (It doesn't include plasma
-  /// store memory usage).
-  int64_t used_object_store_memory_ GUARDED_BY(mu_) = 0;
+  int32_t num_local_objects_ ABSL_GUARDED_BY(mu_) = 0;
+  /// Number of bytes used by this memory store on heap, including both
+  /// placeholder values for objects in plasma and inlined small returned
+  /// objects from task.
+  int64_t num_local_objects_bytes_ ABSL_GUARDED_BY(mu_) = 0;
+
+  /// This lambda is used to allow language frontend to allocate the objects
+  /// in the memory store.
+  std::function<std::shared_ptr<RayObject>(const RayObject &object,
+                                           const ObjectID &object_id)>
+      object_allocator_;
 };
 
 }  // namespace core

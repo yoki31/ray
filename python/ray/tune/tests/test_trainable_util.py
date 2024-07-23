@@ -1,77 +1,17 @@
 import copy
-from collections import OrderedDict
-import os
 import sys
-import shutil
 import unittest
+from collections import OrderedDict
 from unittest.mock import patch
 
-import ray
-import ray._private.utils
-import ray.cloudpickle as cloudpickle
-from ray.tune.utils.util import wait_for_gpu
-from ray.tune.utils.util import (flatten_dict, unflatten_dict,
-                                 unflatten_list_dict)
-from ray.tune.utils.trainable import TrainableUtil
+import pytest
 
-
-class TrainableUtilTest(unittest.TestCase):
-    def setUp(self):
-        self.checkpoint_dir = os.path.join(
-            ray._private.utils.get_user_temp_dir(), "tune", "MyTrainable123")
-        self.checkpoint_dir = TrainableUtil.make_checkpoint_dir(
-            self.checkpoint_dir, "0")
-
-    def tearDown(self):
-        self.addCleanup(shutil.rmtree, self.checkpoint_dir)
-        ray.shutdown()
-
-    def testFindMetadata(self):
-        def tune_one(config=None, checkpoint_dir=None):
-            with ray.tune.checkpoint_dir(step=1):
-                pass
-            ray.tune.report(score=1)
-
-        name = "AnalysisTest"
-        ray.init(local_mode=True)
-        ray.tune.run(tune_one, local_dir=self.checkpoint_dir, name=name)
-
-        a = ray.tune.ExperimentAnalysis(
-            os.path.join(self.checkpoint_dir, name),
-            default_metric="score",
-            default_mode="max")
-        df = a.dataframe()
-        checkpoint_dir = a.get_best_checkpoint(df["logdir"].iloc[0]).local_path
-        assert checkpoint_dir.endswith("/checkpoint_000001/")
-
-    def testFindCheckpointDir(self):
-        checkpoint_path = os.path.join(self.checkpoint_dir,
-                                       "0/my/nested/chkpt")
-        os.makedirs(checkpoint_path)
-        found_dir = TrainableUtil.find_checkpoint_dir(checkpoint_path)
-        self.assertEqual(self.checkpoint_dir, found_dir)
-
-        with self.assertRaises(FileNotFoundError):
-            parent = os.path.dirname(found_dir)
-            TrainableUtil.find_checkpoint_dir(parent)
-
-    def testPickleCheckpoint(self):
-        for i in range(5):
-            path = os.path.join(self.checkpoint_dir, str(i))
-            with open(path, "w") as f:
-                f.write(str(i))
-
-        checkpoint_path = os.path.join(self.checkpoint_dir, "0")
-
-        data_dict = TrainableUtil.pickle_checkpoint(checkpoint_path)
-        loaded = cloudpickle.loads(data_dict)
-
-        checkpoint_name = os.path.basename(checkpoint_path)
-        self.assertEqual(loaded["checkpoint_name"], checkpoint_name)
-
-        for i in range(5):
-            path = os.path.join(self.checkpoint_dir, str(i))
-            self.assertEqual(loaded["data"][str(i)], open(path, "rb").read())
+from ray.tune.utils.util import (
+    flatten_dict,
+    unflatten_dict,
+    unflatten_list_dict,
+    wait_for_gpu,
+)
 
 
 class FlattenDictTest(unittest.TestCase):
@@ -88,24 +28,26 @@ class FlattenDictTest(unittest.TestCase):
         assert result == {"a/b": 1, "c/d": 2, "e": 3}
 
     def test_multi_level_nested(self):
-        ori_in = OrderedDict({
-            "a": {
-                "b": {
-                    "c": {
-                        "d": 1,
+        ori_in = OrderedDict(
+            {
+                "a": {
+                    "b": {
+                        "c": {
+                            "d": 1,
+                        },
                     },
                 },
-            },
-            "b": {
-                "c": {
-                    "d": 2,
+                "b": {
+                    "c": {
+                        "d": 2,
+                    },
                 },
-            },
-            "c": {
-                "d": 3,
-            },
-            "e": 4,
-        })
+                "c": {
+                    "d": 3,
+                },
+                "e": 4,
+            }
+        )
         in_ = copy.deepcopy(ori_in)
         result = flatten_dict(in_)
         assert in_ == ori_in
@@ -160,23 +102,19 @@ class UnflattenDictTest(unittest.TestCase):
         assert result == [{"a": 0}, {"b": 1}, {"c": 2}, 3]
 
     def test_unflatten_list_dict_multi_level_nested(self):
-        result = unflatten_list_dict({
-            "a/0/c/d": 1,
-            "a/1/c": 2,
-            "a/2": 3,
-            "e": 4
-        })
+        result = unflatten_list_dict({"a/0/c/d": 1, "a/1/c": 2, "a/2": 3, "e": 4})
         assert result == {"a": [{"c": {"d": 1}}, {"c": 2}, 3], "e": 4}
 
-        result = unflatten_list_dict({
-            "0/a/0/b": 1,
-            "0/a/1": 2,
-            "1/0": 3,
-            "1/1": 4,
-            "1/2/c": 5,
-            "2": 6
-        })
+        result = unflatten_list_dict(
+            {"0/a/0/b": 1, "0/a/1": 2, "1/0": 3, "1/1": 4, "1/2/c": 5, "2": 6}
+        )
         assert result == [{"a": [{"b": 1}, 2]}, [3, 4, {"c": 5}], 6]
+
+    def test_unflatten_noop(self):
+        """Unflattening an already unflattened dict should be a noop."""
+        unflattened = {"a": 1, "b": {"c": {"d": [1, 2]}, "e": 3}, "f": {"g": 3}}
+        assert unflattened == unflatten_dict(unflattened)
+        assert unflattened == unflatten_list_dict(unflattened)
 
     def test_raises_error_on_key_conflict(self):
         """Ensure that an informative exception is raised on key conflict."""
@@ -237,10 +175,10 @@ class GPUTest(unittest.TestCase):
     @patch("ray.get_gpu_ids", lambda: ["0"])
     def testDefaultGPU(self):
         import sys
+
         sys.modules["GPUtil"] = GPUUtilMock([0], ["GPU-aaa"])
         wait_for_gpu(delay_s=0)
 
 
 if __name__ == "__main__":
-    import pytest
     sys.exit(pytest.main(["-v", __file__]))

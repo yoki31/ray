@@ -1,6 +1,17 @@
-import os
+# Importing for Backward Compatibility
+from ray.air.constants import (  # noqa: F401
+    EXPR_ERROR_FILE,
+    EXPR_ERROR_PICKLE_FILE,
+    EXPR_PARAM_FILE,
+    EXPR_PARAM_PICKLE_FILE,
+    EXPR_PROGRESS_FILE,
+    EXPR_RESULT_FILE,
+    TIME_THIS_ITER_S,
+    TIMESTAMP,
+    TRAINING_ITERATION,
+)
 
-# yapf: disable
+# fmt: off
 # __sphinx_doc_begin__
 # (Optional/Auto-filled) training is terminated. Filled only if not provided.
 DONE = "done"
@@ -32,9 +43,6 @@ EPISODE_REWARD_MEAN = "episode_reward_mean"
 # (Optional) Mean loss for training iteration
 MEAN_LOSS = "mean_loss"
 
-# (Optional) Mean loss for training iteration
-NEG_MEAN_LOSS = "neg_mean_loss"
-
 # (Optional) Mean accuracy for training iteration
 MEAN_ACCURACY = "mean_accuracy"
 
@@ -50,26 +58,32 @@ TIMESTEPS_THIS_ITER = "timesteps_this_iter"
 # (Auto-filled) Accumulated number of timesteps for this entire trial.
 TIMESTEPS_TOTAL = "timesteps_total"
 
-# (Auto-filled) Time in seconds this iteration took to run.
-# This may be overridden to override the system-computed time difference.
-TIME_THIS_ITER_S = "time_this_iter_s"
-
 # (Auto-filled) Accumulated time in seconds for this entire trial.
 TIME_TOTAL_S = "time_total_s"
 
-# (Auto-filled) The index of this training iteration.
-TRAINING_ITERATION = "training_iteration"
 # __sphinx_doc_end__
-# yapf: enable
+# fmt: on
 
 DEFAULT_EXPERIMENT_INFO_KEYS = ("trainable_name", EXPERIMENT_TAG, TRIAL_ID)
 
-DEFAULT_RESULT_KEYS = (TRAINING_ITERATION, TIME_TOTAL_S, TIMESTEPS_TOTAL,
-                       MEAN_ACCURACY, MEAN_LOSS)
+DEFAULT_RESULT_KEYS = (
+    TRAINING_ITERATION,
+    TIME_TOTAL_S,
+    MEAN_ACCURACY,
+    MEAN_LOSS,
+)
 
 # Metrics that don't require at least one iteration to complete
-DEBUG_METRICS = (TRIAL_ID, "experiment_id", "date", "timestamp", PID, HOSTNAME,
-                 NODE_IP, "config")
+DEBUG_METRICS = (
+    TRIAL_ID,
+    "experiment_id",
+    "date",
+    TIMESTAMP,
+    PID,
+    HOSTNAME,
+    NODE_IP,
+    "config",
+)
 
 # Make sure this doesn't regress
 AUTO_RESULT_KEYS = (
@@ -82,13 +96,14 @@ AUTO_RESULT_KEYS = (
     PID,
     TIME_TOTAL_S,
     TIME_THIS_ITER_S,
-    "timestamp",
-    "experiment_id",
+    TIMESTAMP,
     "date",
     "time_since_restore",
-    "iterations_since_restore",
     "timesteps_since_restore",
+    "iterations_since_restore",
     "config",
+    # TODO(justinvyu): Move this stuff to train to avoid cyclical dependency.
+    "checkpoint_dir_name",
 )
 
 # __duplicate__ is a magic keyword used internally to
@@ -104,10 +119,7 @@ TRIAL_INFO = "__trial_info__"
 STDOUT_FILE = "__stdout_file__"
 STDERR_FILE = "__stderr_file__"
 
-# Where Tune writes result files by default
-DEFAULT_RESULTS_DIR = (os.environ.get("TEST_TMPDIR")
-                       or os.environ.get("TUNE_RESULT_DIR")
-                       or os.path.expanduser("~/ray_results"))
+DEFAULT_EXPERIMENT_NAME = "default"
 
 # Meta file about status under each experiment directory, can be
 # parsed by automlboard if exists.
@@ -117,17 +129,5 @@ JOB_META_FILE = "job_status.json"
 # by automlboard if exists.
 EXPR_META_FILE = "trial_status.json"
 
-# File that stores parameters of the trial.
-EXPR_PARAM_FILE = "params.json"
-
-# Pickle File that stores parameters of the trial.
-EXPR_PARAM_PICKLE_FILE = "params.pkl"
-
-# File that stores the progress of the trial.
-EXPR_PROGRESS_FILE = "progress.csv"
-
-# File that stores results of the trial.
-EXPR_RESULT_FILE = "result.json"
-
 # Config prefix when using ExperimentAnalysis.
-CONFIG_PREFIX = "config/"
+CONFIG_PREFIX = "config"

@@ -5,17 +5,19 @@ import time
 import base64
 import numpy as np
 from ray import cloudpickle as pickle
-from six import string_types
 
 logger = logging.getLogger(__name__)
 
 try:
     import lz4.frame
+
     LZ4_ENABLED = True
 except ImportError:
-    logger.warning("lz4 not available, disabling sample compression. "
-                   "This will significantly impact RLlib performance. "
-                   "To install lz4, run `pip install lz4`.")
+    logger.warning(
+        "lz4 not available, disabling sample compression. "
+        "This will significantly impact RLlib performance. "
+        "To install lz4, run `pip install lz4`."
+    )
     LZ4_ENABLED = False
 
 
@@ -60,7 +62,7 @@ def unpack_if_needed(data):
 
 @DeveloperAPI
 def is_compressed(data):
-    return isinstance(data, bytes) or isinstance(data, string_types)
+    return isinstance(data, bytes) or isinstance(data, str)
 
 
 # Intel(R) Core(TM) i7-4600U CPU @ 2.10GHz

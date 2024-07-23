@@ -1,10 +1,12 @@
-from gym.spaces import Space
+from gymnasium.spaces import Space
 from typing import Optional
 
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.exploration.epsilon_greedy import EpsilonGreedy
 from ray.rllib.utils.schedules import ConstantSchedule
 
 
+@OldAPIStack
 class PerWorkerEpsilonGreedy(EpsilonGreedy):
     """A per-worker epsilon-greedy class for distributed algorithms.
 
@@ -13,9 +15,15 @@ class PerWorkerEpsilonGreedy(EpsilonGreedy):
     See Ape-X paper.
     """
 
-    def __init__(self, action_space: Space, *, framework: str,
-                 num_workers: Optional[int], worker_index: Optional[int],
-                 **kwargs):
+    def __init__(
+        self,
+        action_space: Space,
+        *,
+        framework: str,
+        num_workers: Optional[int],
+        worker_index: Optional[int],
+        **kwargs
+    ):
         """Create a PerWorkerEpsilonGreedy exploration class.
 
         Args:
@@ -32,11 +40,9 @@ class PerWorkerEpsilonGreedy(EpsilonGreedy):
             if worker_index > 0:
                 # From page 5 of https://arxiv.org/pdf/1803.00933.pdf
                 alpha, eps, i = 7, 0.4, worker_index - 1
-                num_workers_minus_1 = float(num_workers - 1) \
-                    if num_workers > 1 else 1.0
-                constant_eps = eps**(1 + (i / num_workers_minus_1) * alpha)
-                epsilon_schedule = ConstantSchedule(
-                    constant_eps, framework=framework)
+                num_workers_minus_1 = float(num_workers - 1) if num_workers > 1 else 1.0
+                constant_eps = eps ** (1 + (i / num_workers_minus_1) * alpha)
+                epsilon_schedule = ConstantSchedule(constant_eps, framework=framework)
             # Local worker should have zero exploration so that eval
             # rollouts run properly.
             else:
@@ -48,4 +54,5 @@ class PerWorkerEpsilonGreedy(EpsilonGreedy):
             framework=framework,
             num_workers=num_workers,
             worker_index=worker_index,
-            **kwargs)
+            **kwargs
+        )

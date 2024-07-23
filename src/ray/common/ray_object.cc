@@ -18,6 +18,9 @@
 
 namespace {
 
+static const std::string kObjectInPlasmaStr =
+    std::to_string(ray::rpc::ErrorType::OBJECT_IN_PLASMA);
+
 std::shared_ptr<ray::LocalMemoryBuffer> MakeBufferFromString(const uint8_t *data,
                                                              size_t data_size) {
   auto metadata = const_cast<uint8_t *>(data);
@@ -51,7 +54,7 @@ std::shared_ptr<ray::LocalMemoryBuffer> MakeErrorMetadataBuffer(
 /// \param protobuf_message The protobuf message to serialize.
 /// \return The buffer that contains serialized msgpack message.
 template <class ProtobufMessage>
-std::shared_ptr<ray::LocalMemoryBuffer> MakeSerializeErrorBuffer(
+std::shared_ptr<ray::LocalMemoryBuffer> MakeSerializedErrorBuffer(
     const ProtobufMessage &protobuf_message) {
   // Structure of bytes stored in object store:
 
@@ -75,7 +78,8 @@ std::shared_ptr<ray::LocalMemoryBuffer> MakeSerializeErrorBuffer(
                                                kMessagePackOffset);
   // copy msgpack-serialized bytes
   std::memcpy(final_buffer->Data() + kMessagePackOffset,
-              msgpack_serialized_exception.data(), msgpack_serialized_exception.size());
+              msgpack_serialized_exception.data(),
+              msgpack_serialized_exception.size());
   // copy offset
   msgpack::sbuffer msgpack_int;
   msgpack::pack(msgpack_int, msgpack_serialized_exception.size());
@@ -96,23 +100,26 @@ RayObject::RayObject(rpc::ErrorType error_type, const rpc::RayErrorInfo *ray_err
     return;
   }
 
-  RAY_CHECK(ray_error_info->has_actor_init_failure());
-  // This is temporarily here because changing this requires changes in all language
-  // frontend.
-  // TODO(sang, lixin): Remove it.
-  const auto error_buffer =
-      MakeSerializeErrorBuffer<rpc::RayException>(ray_error_info->actor_init_failure());
+  const auto error_buffer = MakeSerializedErrorBuffer<rpc::RayErrorInfo>(*ray_error_info);
   Init(std::move(error_buffer), MakeErrorMetadataBuffer(error_type), {});
   return;
 }
 
 bool RayObject::IsException(rpc::ErrorType *error_type) const {
-  if (metadata_ == nullptr) {
+  // For performance, assume metadata of >2 chars (e.g., "PYTHON"), is not an error.
+  static_assert(ray::rpc::ErrorType_MAX < 100);
+  if (metadata_ == nullptr || metadata_->Size() > 2) {
     return false;
   }
   // TODO (kfstorm): metadata should be structured.
-  const std::string metadata(reinterpret_cast<const char *>(metadata_->Data()),
-                             metadata_->Size());
+  const std::string_view metadata(reinterpret_cast<const char *>(metadata_->Data()),
+                                  metadata_->Size());
+  if (metadata == kObjectInPlasmaStr) {
+    if (error_type) {
+      *error_type = rpc::ErrorType::OBJECT_IN_PLASMA;
+    }
+    return true;
+  }
   const auto error_type_descriptor = ray::rpc::ErrorType_descriptor();
   for (int i = 0; i < error_type_descriptor->value_count(); i++) {
     const auto error_type_number = error_type_descriptor->value(i)->number();
@@ -130,9 +137,9 @@ bool RayObject::IsInPlasmaError() const {
   if (metadata_ == nullptr) {
     return false;
   }
-  const std::string metadata(reinterpret_cast<const char *>(metadata_->Data()),
-                             metadata_->Size());
-  return metadata == std::to_string(ray::rpc::ErrorType::OBJECT_IN_PLASMA);
+  const std::string_view metadata(reinterpret_cast<const char *>(metadata_->Data()),
+                                  metadata_->Size());
+  return metadata == kObjectInPlasmaStr;
 }
 
 }  // namespace ray

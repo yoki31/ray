@@ -24,7 +24,7 @@ enum MessageType:int {
   SubmitTask = 1,
   // Notify the raylet that a task has finished. This is sent from a
   // worker to a raylet.
-  TaskDone,
+  ActorCreationTaskDone,
   // Log a message to the event table. This is sent from a worker to a raylet.
   EventLogMessage,
   // Send an initial connection message to the raylet. This is sent
@@ -35,6 +35,8 @@ enum MessageType:int {
   RegisterClientReply,
   // Send the worker's gRPC port to the raylet.
   AnnounceWorkerPort,
+  // Ack that the raylet has finished handling AnnounceWorkerPort.
+  AnnounceWorkerPortReply,
   // Notify the raylet that this client is disconnecting.
   // This is sent from a worker to a raylet.
   DisconnectClient,
@@ -70,19 +72,8 @@ enum MessageType:int {
   SubscribePlasmaReady,
 }
 
-table TaskExecutionSpecification {
-  // A list of object IDs representing the dependencies of this task that may
-  // change at execution time.
-  dependencies: [string];
-  // The last time this task was received for scheduling.
-  last_timestamp: double;
-  // The number of times this task was spilled back by raylets.
-  num_forwards: int;
-}
-
 table Task {
   task_specification: string;
-  task_execution_spec: TaskExecutionSpecification;
 }
 
 table SubmitTaskRequest {
@@ -104,6 +95,7 @@ table ResourceIdSetInfo {
 // This message is sent from a worker to the node manager.
 table DisconnectClient {
   disconnect_type: int;
+  disconnect_detail: string;
   // Creation task exception serialized by protobuf.
   // Contains a RayException defined in common.pb
   creation_task_exception_pb: [ubyte];
@@ -123,8 +115,6 @@ table RegisterClientRequest {
   worker_id: string;
   // The process ID of this worker.
   worker_pid: long;
-  // The PID of the process for setup worker runtime env.
-  worker_shim_pid: long;
   // The startup token of the process assigned to
   // it during startup as a command line argument.
   startup_token: long;
@@ -152,13 +142,20 @@ table RegisterClientReply {
   raylet_id: string;
   // Port that this worker should listen on.
   port: int;
-  // The config bytes of this job serialized with protobuf.
-  serialized_job_config: string;
 }
 
 table AnnounceWorkerPort {
   // Port that this worker is listening on.
   port: int;
+  // The entrypoint of the job. Only populated if the worker is a driver.
+  entrypoint: string;
+}
+
+table AnnounceWorkerPortReply {
+  // Whether the announcement and job registration succeeded.
+  success: bool;
+  // The reason of registration failure.
+  failure_reason: string;
 }
 
 table RegisterNodeManagerRequest {
@@ -182,9 +179,6 @@ table FetchOrReconstruct {
   owner_addresses: [Address];
   // Do we only want to fetch the objects or also reconstruct them?
   fetch_only: bool;
-  // False for direct call tasks. Blocking for those tasks is handled via the
-  // NotifyDirectCallTaskBlocked/Unblocked IPCs.
-  mark_worker_blocked: bool;
   // The current task ID.
   task_id: string;
 }
@@ -210,9 +204,6 @@ table WaitRequest {
   num_ready_objects: int;
   // timeout
   timeout: long;
-  // False for direct call tasks. Blocking for those tasks is handled via the
-  // NotifyDirectCallTaskBlocked/Unblocked IPCs.
-  mark_worker_blocked: bool;
   // The current task ID.
   task_id: string;
 }

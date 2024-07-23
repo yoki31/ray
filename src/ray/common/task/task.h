@@ -17,7 +17,6 @@
 #include <inttypes.h>
 
 #include "ray/common/task/task_common.h"
-#include "ray/common/task/task_execution_spec.h"
 #include "ray/common/task/task_spec.h"
 
 namespace ray {
@@ -41,23 +40,15 @@ class RayTask {
   /// \param message The protobuf message.
   explicit RayTask(const rpc::Task &message);
 
-  /// Construct a `RayTask` object from a `TaskSpecification` and a
-  /// `TaskExecutionSpecification`.
-  RayTask(TaskSpecification task_spec, TaskExecutionSpecification task_execution_spec);
+  /// Construct a `RayTask` object from a `TaskSpecification`.
+  RayTask(TaskSpecification task_spec);
 
-  /// Get the mutable specification for the task. This specification may be
-  /// updated at runtime.
-  ///
-  /// \return The mutable specification for the task.
-  const TaskExecutionSpecification &GetTaskExecutionSpec() const;
+  RayTask(TaskSpecification task_spec, std::string preferred_node_id);
 
   /// Get the immutable specification for the task.
   ///
   /// \return The immutable specification for the task.
   const TaskSpecification &GetTaskSpecification() const;
-
-  /// Increment the number of times this task has been forwarded.
-  void IncrementNumForwards();
 
   /// Get the task's object dependencies. This comprises the immutable task
   /// arguments and the mutable execution dependencies.
@@ -65,9 +56,11 @@ class RayTask {
   /// \return The object dependencies.
   const std::vector<rpc::ObjectReference> &GetDependencies() const;
 
-  /// Update the dynamic/mutable information for this task.
-  /// \param task RayTask structure with updated dynamic information.
-  void CopyTaskExecutionSpec(const RayTask &task);
+  /// Get the task's preferred node id for scheduling. If the returned value
+  /// is empty, then it means the task has no preferred node.
+  ///
+  /// \return The preferred node id.
+  const std::string &GetPreferredNodeID() const;
 
   std::string DebugString() const;
 
@@ -78,13 +71,11 @@ class RayTask {
   /// task determined at submission time. Includes resource demand, object
   /// dependencies, etc.
   TaskSpecification task_spec_;
-  /// RayTask execution specification, consisting of all dynamic/mutable
-  /// information about this task determined at execution time.
-  TaskExecutionSpecification task_execution_spec_;
   /// A cached copy of the task's object dependencies, including arguments from
-  /// the TaskSpecification and execution dependencies from the
-  /// TaskExecutionSpecification.
+  /// the TaskSpecification.
   std::vector<rpc::ObjectReference> dependencies_;
+
+  std::string preferred_node_id_;
 };
 
 }  // namespace ray

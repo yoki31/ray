@@ -26,11 +26,15 @@ namespace ray {
 namespace raylet {
 
 /// A constructor responsible for initializing the state of a worker.
-Worker::Worker(const JobID &job_id, const int runtime_env_hash, const WorkerID &worker_id,
-               const Language &language, rpc::WorkerType worker_type,
+Worker::Worker(const JobID &job_id,
+               const int runtime_env_hash,
+               const WorkerID &worker_id,
+               const Language &language,
+               rpc::WorkerType worker_type,
                const std::string &ip_address,
                std::shared_ptr<ClientConnection> connection,
-               rpc::ClientCallManager &client_call_manager, StartupToken startup_token)
+               rpc::ClientCallManager &client_call_manager,
+               StartupToken startup_token)
     : worker_id_(worker_id),
       startup_token_(startup_token),
       language_(language),
@@ -74,16 +78,6 @@ void Worker::SetStartupToken(StartupToken startup_token) {
   startup_token_ = startup_token;
 }
 
-Process Worker::GetShimProcess() const {
-  RAY_CHECK(worker_type_ != rpc::WorkerType::DRIVER);
-  return shim_proc_;
-}
-
-void Worker::SetShimProcess(Process proc) {
-  RAY_CHECK(shim_proc_.IsNull());  // this procedure should not be called multiple times
-  shim_proc_ = std::move(proc);
-}
-
 Language Worker::GetLanguage() const { return language_; }
 
 const std::string Worker::IpAddress() const { return ip_address_; }
@@ -102,6 +96,20 @@ int Worker::AssignedPort() const { return assigned_port_; }
 
 void Worker::SetAssignedPort(int port) { assigned_port_ = port; };
 
+void Worker::AsyncNotifyGCSRestart() {
+  if (rpc_client_) {
+    rpc::RayletNotifyGCSRestartRequest request;
+    rpc_client_->RayletNotifyGCSRestart(request, [](Status status, auto reply) {
+      if (!status.ok()) {
+        RAY_LOG(ERROR) << "Failed to notify worker about GCS restarting: "
+                       << status.ToString();
+      }
+    });
+  } else {
+    notify_gcs_restarted_ = true;
+  }
+}
+
 void Worker::Connect(int port) {
   RAY_CHECK(port > 0);
   port_ = port;
@@ -109,29 +117,21 @@ void Worker::Connect(int port) {
   addr.set_ip_address(ip_address_);
   addr.set_port(port_);
   rpc_client_ = std::make_unique<rpc::CoreWorkerClient>(addr, client_call_manager_);
+  Connect(rpc_client_);
 }
 
 void Worker::Connect(std::shared_ptr<rpc::CoreWorkerClientInterface> rpc_client) {
   rpc_client_ = rpc_client;
+  if (notify_gcs_restarted_) {
+    // We need to send RPC to notify about the GCS restarts
+    AsyncNotifyGCSRestart();
+    notify_gcs_restarted_ = false;
+  }
 }
 
 void Worker::AssignTaskId(const TaskID &task_id) { assigned_task_id_ = task_id; }
 
 const TaskID &Worker::GetAssignedTaskId() const { return assigned_task_id_; }
-
-bool Worker::AddBlockedTaskId(const TaskID &task_id) {
-  auto inserted = blocked_task_ids_.insert(task_id);
-  return inserted.second;
-}
-
-bool Worker::RemoveBlockedTaskId(const TaskID &task_id) {
-  auto erased = blocked_task_ids_.erase(task_id);
-  return erased == 1;
-}
-
-const std::unordered_set<TaskID> &Worker::GetBlockedTaskIds() const {
-  return blocked_task_ids_;
-}
 
 const JobID &Worker::GetAssignedJobId() const { return assigned_job_id_; }
 
@@ -145,6 +145,16 @@ void Worker::AssignActorId(const ActorID &actor_id) {
 }
 
 const ActorID &Worker::GetActorId() const { return actor_id_; }
+
+const std::string Worker::GetTaskOrActorIdAsDebugString() const {
+  std::stringstream id_ss;
+  if (GetActorId().IsNil()) {
+    id_ss << "task ID: " << GetAssignedTaskId();
+  } else {
+    id_ss << "actor ID: " << GetActorId();
+  }
+  return id_ss.str();
+}
 
 void Worker::MarkDetachedActor() { is_detached_actor_ = true; }
 
@@ -171,6 +181,16 @@ void Worker::DirectActorCallArgWaitComplete(int64_t tag) {
 const BundleID &Worker::GetBundleId() const { return bundle_id_; }
 
 void Worker::SetBundleId(const BundleID &bundle_id) { bundle_id_ = bundle_id; }
+
+void Worker::SetJobId(const JobID &job_id) {
+  if (assigned_job_id_.IsNil()) {
+    assigned_job_id_ = job_id;
+  }
+
+  RAY_CHECK(assigned_job_id_ == job_id)
+      << "Job_id mismatch, assigned: " << assigned_job_id_.Hex()
+      << ", actual: " << job_id.Hex();
+}
 
 }  // namespace raylet
 

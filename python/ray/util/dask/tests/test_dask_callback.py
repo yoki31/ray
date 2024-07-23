@@ -1,8 +1,14 @@
+import sys
+
 import dask
 import pytest
 
 import ray
 from ray.util.dask import ray_dask_get, RayDaskCallback
+
+pytestmark = pytest.mark.skipif(
+    sys.version_info >= (3, 12), reason="Skip dask tests for Python version 3.12+"
+)
 
 
 @pytest.fixture
@@ -39,8 +45,10 @@ def test_presubmit_shortcircuit(ray_start_1_cpu):
             return 0
 
         def _ray_postsubmit(self, task, key, deps, object_ref):
-            pytest.fail("_ray_postsubmit shouldn't be called when "
-                        "_ray_presubmit returns a value")
+            pytest.fail(
+                "_ray_postsubmit shouldn't be called when "
+                "_ray_presubmit returns a value"
+            )
 
     with PresubmitShortcircuitCallback():
         z = add(2, 3)
@@ -79,8 +87,7 @@ def test_postsubmit(ray_start_1_cpu):
             self.postsubmit_actor = postsubmit_actor
 
         def _ray_postsubmit(self, task, key, deps, object_ref):
-            self.postsubmit_actor.postsubmit.remote(task, key, deps,
-                                                    object_ref)
+            self.postsubmit_actor.postsubmit.remote(task, key, deps, object_ref)
 
     @ray.remote
     class PostsubmitActor:
@@ -176,8 +183,7 @@ def test_multiple_callbacks(ray_start_1_cpu):
             self.postsubmit_actor = postsubmit_actor
 
         def _ray_postsubmit(self, task, key, deps, object_ref):
-            self.postsubmit_actor.postsubmit.remote(task, key, deps,
-                                                    object_ref)
+            self.postsubmit_actor.postsubmit.remote(task, key, deps, object_ref)
 
     @ray.remote
     class PostsubmitActor:
@@ -239,4 +245,5 @@ def test_pretask_posttask_shared_state_multi(ray_start_1_cpu):
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main(["-v", __file__]))

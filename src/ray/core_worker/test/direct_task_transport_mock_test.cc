@@ -34,17 +34,22 @@ class DirectTaskTransportTest : public ::testing::Test {
     lease_policy = std::make_shared<MockLeasePolicyInterface>();
     auto client_pool = std::make_shared<rpc::CoreWorkerClientPool>(
         [&](const rpc::Address &) { return nullptr; });
+    static std::shared_ptr<LeaseRequestRateLimiter> kRateLimiter =
+        std::make_shared<StaticLeaseRequestRateLimiter>(1);
     task_submitter = std::make_unique<CoreWorkerDirectTaskSubmitter>(
         rpc::Address(), /* rpc_address */
         raylet_client,  /* lease_client */
         client_pool,    /* core_worker_client_pool */
         nullptr,        /* lease_client_factory */
         lease_policy,   /* lease_policy */
-        std::make_shared<CoreWorkerMemoryStore>(), task_finisher,
+        std::make_shared<CoreWorkerMemoryStore>(),
+        task_finisher,
         NodeID::Nil(),      /* local_raylet_id */
         WorkerType::WORKER, /* worker_type */
         0,                  /* lease_timeout_ms */
-        actor_creator, JobID::Nil() /* job_id */);
+        actor_creator,
+        JobID::Nil() /* job_id */,
+        kRateLimiter);
   }
 
   TaskSpecification GetCreatingTaskSpec(const ActorID &actor_id) {
@@ -67,7 +72,7 @@ class DirectTaskTransportTest : public ::testing::Test {
 TEST_F(DirectTaskTransportTest, ActorRegisterOk) {
   auto actor_id = ActorID::FromHex("f4ce02420592ca68c1738a0d01000000");
   auto task_spec = GetCreatingTaskSpec(actor_id);
-  EXPECT_CALL(*task_finisher, CompletePendingTask(task_spec.TaskId(), _, _));
+  EXPECT_CALL(*task_finisher, CompletePendingTask(task_spec.TaskId(), _, _, _));
   rpc::ClientCallback<rpc::CreateActorReply> create_cb;
   EXPECT_CALL(*actor_creator, AsyncCreateActor(task_spec, _))
       .WillOnce(DoAll(SaveArg<1>(&create_cb), Return(Status::OK())));
@@ -78,10 +83,11 @@ TEST_F(DirectTaskTransportTest, ActorRegisterOk) {
 TEST_F(DirectTaskTransportTest, ActorCreationFail) {
   auto actor_id = ActorID::FromHex("f4ce02420592ca68c1738a0d01000000");
   auto task_spec = GetCreatingTaskSpec(actor_id);
-  EXPECT_CALL(*task_finisher, CompletePendingTask(_, _, _)).Times(0);
-  EXPECT_CALL(*task_finisher,
-              FailOrRetryPendingTask(task_spec.TaskId(),
-                                     rpc::ErrorType::ACTOR_CREATION_FAILED, _, _, true));
+  EXPECT_CALL(*task_finisher, CompletePendingTask(_, _, _, _)).Times(0);
+  EXPECT_CALL(
+      *task_finisher,
+      FailOrRetryPendingTask(
+          task_spec.TaskId(), rpc::ErrorType::ACTOR_CREATION_FAILED, _, _, true, false));
   rpc::ClientCallback<rpc::CreateActorReply> create_cb;
   EXPECT_CALL(*actor_creator, AsyncCreateActor(task_spec, _))
       .WillOnce(DoAll(SaveArg<1>(&create_cb), Return(Status::OK())));

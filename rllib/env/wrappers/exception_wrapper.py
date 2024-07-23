@@ -1,7 +1,7 @@
 import logging
 import traceback
 
-import gym
+import gymnasium as gym
 
 logger = logging.getLogger(__name__)
 
@@ -10,7 +10,8 @@ class TooManyResetAttemptsException(Exception):
     def __init__(self, max_attempts: int):
         super().__init__(
             f"Reached the maximum number of attempts ({max_attempts}) "
-            f"to reset an environment.")
+            f"to reset an environment."
+        )
 
 
 class ResetOnExceptionWrapper(gym.Wrapper):

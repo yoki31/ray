@@ -1,3 +1,9 @@
+
+.. include:: /_includes/rllib/we_are_hiring.rst
+
+.. include:: /_includes/rllib/new_api_stack.rst
+
+
 .. _env-reference-docs:
 
 Environments
@@ -7,7 +13,7 @@ Any environment type provided by you to RLlib (e.g. a user-defined `gym.Env <htt
 is converted internally into the :py:class:`~ray.rllib.env.base_env.BaseEnv` API, whose main methods are ``poll()`` and ``send_actions()``:
 
 .. https://docs.google.com/drawings/d/1NtbVk-Mo89liTRx-sHu_7fqi3Kn7Hjdf3i6jIMbxGlY/edit
-.. image:: ../../images/rllib/env_classes_overview.svg
+.. image:: ../images/env_classes_overview.svg
 
 
 The :py:class:`~ray.rllib.env.base_env.BaseEnv` API allows RLlib to support:
@@ -23,11 +29,11 @@ For example, if you provide a custom `gym.Env <https://github.com/openai/gym>`_ 
 
 Here is a simple example:
 
-.. literalinclude:: ../../../../rllib/examples/documentation/custom_gym_env.py
+.. literalinclude:: ../doc_code/custom_gym_env.py
    :language: python
 
-..   start-after: __sphinx_doc_model_construct_1_begin__
-..   end-before: __sphinx_doc_model_construct_1_end__
+..   start-after: __rllib-custom-gym-env-begin__
+..   end-before: __rllib-custom-gym-env-end__
 
 However, you may also conveniently sub-class any of the other supported RLlib-specific
 environment types. The automated paths from those env types (or callables returning instances of those types) to

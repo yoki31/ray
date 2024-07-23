@@ -1,9 +1,14 @@
+# @OldAPIStack
 import argparse
-from gym.spaces import Box, Discrete
+from gymnasium.spaces import Box, Discrete
 import numpy as np
 
-from ray.rllib.examples.models.custom_model_api import DuelingQModel, \
-    TorchDuelingQModel, ContActionQModel, TorchContActionQModel
+from ray.rllib.examples._old_api_stack.models.custom_model_api import (
+    DuelingQModel,
+    TorchDuelingQModel,
+    ContActionQModel,
+    TorchContActionQModel,
+)
 from ray.rllib.models.catalog import ModelCatalog, MODEL_DEFAULTS
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils.framework import try_import_tf, try_import_torch
@@ -14,16 +19,17 @@ torch, _ = try_import_torch()
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--framework",
-    choices=["tf", "tf2", "tfe", "torch"],
-    default="tf",
-    help="The DL framework specifier.")
+    choices=["tf", "tf2", "torch"],
+    default="torch",
+    help="The DL framework specifier.",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
 
     # Test API wrapper for dueling Q-head.
 
-    obs_space = Box(-1.0, 1.0, (3, ))
+    obs_space = Box(-1.0, 1.0, (3,))
     action_space = Discrete(3)
 
     # Run in eager mode for value checking and debugging.
@@ -41,7 +47,8 @@ if __name__ == "__main__":
         # (DuelingQModel). This way, both `forward` and `get_q_values`
         # are available in the returned class.
         model_interface=DuelingQModel
-        if args.framework != "torch" else TorchDuelingQModel,
+        if args.framework != "torch"
+        else TorchDuelingQModel,
         name="dueling_q_model",
     )
     # __sphinx_doc_model_construct_1_end__
@@ -61,8 +68,8 @@ if __name__ == "__main__":
 
     # Test API wrapper for single value Q-head from obs/action input.
 
-    obs_space = Box(-1.0, 1.0, (3, ))
-    action_space = Box(-1.0, -1.0, (2, ))
+    obs_space = Box(-1.0, 1.0, (3,))
+    action_space = Box(-1.0, -1.0, (2,))
 
     # __sphinx_doc_model_construct_2_begin__
     my_cont_action_q_model = ModelCatalog.get_model_v2(
@@ -76,7 +83,8 @@ if __name__ == "__main__":
         # (DuelingQModel). This way, both `forward` and `get_q_values`
         # are available in the returned class.
         model_interface=ContActionQModel
-        if args.framework != "torch" else TorchContActionQModel,
+        if args.framework != "torch"
+        else TorchContActionQModel,
         name="cont_action_q_model",
     )
     # __sphinx_doc_model_construct_2_end__

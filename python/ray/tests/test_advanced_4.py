@@ -1,8 +1,18 @@
-import pytest
-import ray
+from unittest import mock
 import subprocess
 import sys
-from ray._private.test_utils import Semaphore
+
+import pytest
+
+import ray
+from ray._raylet import check_health
+from ray._private.test_utils import (
+    Semaphore,
+    client_test_enabled,
+    wait_for_condition,
+    get_gcs_memory_used,
+)
+from ray.experimental.internal_kv import _internal_kv_list
 
 
 @pytest.fixture
@@ -38,34 +48,34 @@ def test_ray_memory(shutdown_only):
 
 def test_jemalloc_env_var_propagate():
     """Test `propagate_jemalloc_env_var`"""
-    gcs_ptype = ray.ray_constants.PROCESS_TYPE_GCS_SERVER
+    gcs_ptype = ray._private.ray_constants.PROCESS_TYPE_GCS_SERVER
     """
     If the shared library path is not specified,
     it should return an empty dict.
     """
     expected = {}
     actual = ray._private.services.propagate_jemalloc_env_var(
-        jemalloc_path="",
-        jemalloc_conf="",
-        jemalloc_comps=[],
-        process_type=gcs_ptype)
+        jemalloc_path="", jemalloc_conf="", jemalloc_comps=[], process_type=gcs_ptype
+    )
     assert actual == expected
     actual = ray._private.services.propagate_jemalloc_env_var(
         jemalloc_path=None,
         jemalloc_conf="a,b,c",
-        jemalloc_comps=[ray.ray_constants.PROCESS_TYPE_GCS_SERVER],
-        process_type=gcs_ptype)
+        jemalloc_comps=[ray._private.ray_constants.PROCESS_TYPE_GCS_SERVER],
+        process_type=gcs_ptype,
+    )
     assert actual == expected
     """
     When the shared library is specified
     """
     library_path = "/abc"
-    expected = {"LD_PRELOAD": library_path}
+    expected = {"LD_PRELOAD": library_path, "RAY_LD_PRELOAD": "1"}
     actual = ray._private.services.propagate_jemalloc_env_var(
         jemalloc_path=library_path,
         jemalloc_conf="",
-        jemalloc_comps=[ray.ray_constants.PROCESS_TYPE_GCS_SERVER],
-        process_type=gcs_ptype)
+        jemalloc_comps=[ray._private.ray_constants.PROCESS_TYPE_GCS_SERVER],
+        process_type=gcs_ptype,
+    )
     assert actual == expected
 
     # comps should be a list type.
@@ -73,28 +83,57 @@ def test_jemalloc_env_var_propagate():
         ray._private.services.propagate_jemalloc_env_var(
             jemalloc_path=library_path,
             jemalloc_conf="",
-            jemalloc_comps="ray.ray_constants.PROCESS_TYPE_GCS_SERVER,",
-            process_type=gcs_ptype)
+            jemalloc_comps="ray._private.ray_constants.PROCESS_TYPE_GCS_SERVER,",
+            process_type=gcs_ptype,
+        )
 
     # When comps don't match the process_type, it should return an empty dict.
     expected = {}
     actual = ray._private.services.propagate_jemalloc_env_var(
         jemalloc_path=library_path,
         jemalloc_conf="",
-        jemalloc_comps=[ray.ray_constants.PROCESS_TYPE_RAYLET],
-        process_type=gcs_ptype)
+        jemalloc_comps=[ray._private.ray_constants.PROCESS_TYPE_RAYLET],
+        process_type=gcs_ptype,
+    )
     """
     When the malloc config is specified
     """
     library_path = "/abc"
     malloc_conf = "a,b,c"
-    expected = {"LD_PRELOAD": library_path, "MALLOC_CONF": malloc_conf}
+    expected = {
+        "LD_PRELOAD": library_path,
+        "MALLOC_CONF": malloc_conf,
+        "RAY_LD_PRELOAD": "1",
+    }
     actual = ray._private.services.propagate_jemalloc_env_var(
         jemalloc_path=library_path,
         jemalloc_conf=malloc_conf,
-        jemalloc_comps=[ray.ray_constants.PROCESS_TYPE_GCS_SERVER],
-        process_type=gcs_ptype)
+        jemalloc_comps=[ray._private.ray_constants.PROCESS_TYPE_GCS_SERVER],
+        process_type=gcs_ptype,
+    )
     assert actual == expected
+
+
+def test_check_health(shutdown_only):
+    assert not check_health("127.0.0.1:8888")
+    # Should not raise error: https://github.com/ray-project/ray/issues/38785
+    assert not check_health("ip:address:with:colon:name:8265")
+
+    with pytest.raises(ValueError):
+        check_health("bad_address_no_port")
+
+    conn = ray.init()
+    addr = conn.address_info["address"]
+    assert check_health(addr)
+
+
+def test_check_health_version_check(shutdown_only):
+    with mock.patch("ray.__version__", "FOO-VERSION"):
+        conn = ray.init()
+        addr = conn.address_info["address"]
+        assert check_health(addr, skip_version_check=True)
+        with pytest.raises(RuntimeError):
+            check_health(addr)
 
 
 def test_back_pressure(shutdown_only_with_initialization_check):
@@ -157,6 +196,105 @@ def test_local_mode_deadlock(shutdown_only_with_initialization_check):
     assert ray.get(foo.ping_actor.remote(bar)) == 3
 
 
+def function_entry_num(job_id):
+    from ray._private.ray_constants import KV_NAMESPACE_FUNCTION_TABLE
+
+    return (
+        len(
+            _internal_kv_list(
+                b"RemoteFunction:" + job_id, namespace=KV_NAMESPACE_FUNCTION_TABLE
+            )
+        )
+        + len(
+            _internal_kv_list(
+                b"ActorClass:" + job_id, namespace=KV_NAMESPACE_FUNCTION_TABLE
+            )
+        )
+        + len(
+            _internal_kv_list(
+                b"FunctionsToRun:" + job_id, namespace=KV_NAMESPACE_FUNCTION_TABLE
+            )
+        )
+    )
+
+
+@pytest.mark.skipif(
+    client_test_enabled(), reason="client api doesn't support namespace right now."
+)
+def test_function_table_gc(call_ray_start):
+    """This test tries to verify that function table is cleaned up
+    after job exits.
+    """
+
+    def f():
+        data = "0" * 1024 * 1024  # 1MB
+
+        @ray.remote
+        def r():
+            nonlocal data
+
+            @ray.remote
+            class Actor:
+                pass
+
+        return r.remote()
+
+    ray.init(address="auto", namespace="b")
+
+    # It should use > 500MB data
+    ray.get([f() for _ in range(500)])
+
+    # It's not working on win32.
+    if sys.platform != "win32":
+        assert get_gcs_memory_used() > 500 * 1024 * 1024
+    job_id = ray._private.worker.global_worker.current_job_id.hex().encode()
+    assert function_entry_num(job_id) > 0
+    ray.shutdown()
+
+    # now check the function table is cleaned up after job finished
+    ray.init(address="auto", namespace="a")
+    wait_for_condition(lambda: function_entry_num(job_id) == 0, timeout=30)
+
+
+@pytest.mark.skipif(
+    client_test_enabled(), reason="client api doesn't support namespace right now."
+)
+def test_function_table_gc_actor(call_ray_start):
+    """If there is a detached actor, the table won't be cleaned up."""
+    ray.init(address="auto", namespace="a")
+
+    @ray.remote
+    class Actor:
+        def ready(self):
+            return
+
+    # If there is a detached actor, the function won't be deleted.
+    a = Actor.options(lifetime="detached", name="a").remote()
+    ray.get(a.ready.remote())
+    job_id = ray._private.worker.global_worker.current_job_id.hex().encode()
+    ray.shutdown()
+
+    ray.init(address="auto", namespace="b")
+    with pytest.raises(Exception):
+        wait_for_condition(lambda: function_entry_num(job_id) == 0)
+    a = ray.get_actor("a", namespace="a")
+    ray.kill(a)
+    wait_for_condition(lambda: function_entry_num(job_id) == 0)
+
+    # If there is not a detached actor, it'll be deleted when the job finishes.
+    a = Actor.remote()
+    ray.get(a.ready.remote())
+    job_id = ray._private.worker.global_worker.current_job_id.hex().encode()
+    ray.shutdown()
+    ray.init(address="auto", namespace="c")
+    wait_for_condition(lambda: function_entry_num(job_id) == 0)
+
+
 if __name__ == "__main__":
+    import os
     import pytest
-    sys.exit(pytest.main(["-v", __file__]))
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

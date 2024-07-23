@@ -14,6 +14,7 @@
 #pragma once
 #include <functional>
 
+#include "absl/container/flat_hash_map.h"
 #include "ray/common/id.h"
 #include "src/ray/protobuf/common.pb.h"
 
@@ -33,12 +34,18 @@ class RuntimeEnvManager {
       std::function<void(const std::string &uri, std::function<void(bool successful)>)>;
   explicit RuntimeEnvManager(DeleteFunc deleter) : deleter_(deleter) {}
 
-  /// Increase the reference of URI by job_id and runtime_env.
+  /// Increase the reference of URI by job or actor ID and runtime_env.
   ///
   /// \param[in] hex_id The id of the runtime env. It can be an actor or job id.
   /// \param[in] runtime_env_info The runtime env used by the id.
   void AddURIReference(const std::string &hex_id,
                        const rpc::RuntimeEnvInfo &runtime_env_info);
+
+  /// Increase the reference of URI by job or actor ID and runtime_env.
+  ///
+  /// \param[in] hex_id The id of the runtime env. It can be an actor or job id.
+  /// \param[in] uri The URI to increase the reference for.
+  void AddURIReference(const std::string &hex_id, const std::string &uri);
 
   /// Get the reference of URIs by id.
   ///
@@ -50,12 +57,16 @@ class RuntimeEnvManager {
   /// \param[in] hex_id The id of the runtime env.
   void RemoveURIReference(const std::string &hex_id);
 
+  std::string DebugString() const;
+
  private:
+  void PrintDebugString() const;
+
   DeleteFunc deleter_;
   /// Reference counting of a URI.
-  std::unordered_map<std::string, int64_t> uri_reference_;
+  absl::flat_hash_map<std::string, int64_t> uri_reference_;
   /// A map between hex_id and URI.
-  std::unordered_map<std::string, std::vector<std::string>> id_to_uris_;
+  absl::flat_hash_map<std::string, std::vector<std::string>> id_to_uris_;
   /// A set of unused URIs
   std::unordered_set<std::string> unused_uris_;
 };

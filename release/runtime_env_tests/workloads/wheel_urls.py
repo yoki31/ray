@@ -15,21 +15,18 @@ Acceptance criteria: Should run through and print "PASSED"
 """
 
 import ray
-import os
-import json
 import time
 import requests
 import pprint
 
+import ray._private.ray_constants as ray_constants
 from ray._private.utils import get_master_wheel_url, get_release_wheel_url
+from ray._private.test_utils import safe_write_to_results_json
 
 
 def update_progress(result):
     result["last_update"] = time.time()
-    test_output_json = os.environ.get("TEST_OUTPUT_JSON",
-                                      "/tmp/release_test_output.json")
-    with open(test_output_json, "wt") as f:
-        json.dump(result, f)
+    safe_write_to_results_json(result)
 
 
 if __name__ == "__main__":
@@ -39,19 +36,21 @@ if __name__ == "__main__":
 
     retry = set()
     for sys_platform in ["darwin", "linux", "win32"]:
-        for py_version in ["36", "37", "38", "39"]:
+        for py_version in ray_constants.RUNTIME_ENV_CONDA_PY_VERSIONS:
             if "dev" in ray.__version__:
                 url = get_master_wheel_url(
                     ray_commit=ray.__commit__,
                     sys_platform=sys_platform,
                     ray_version=ray.__version__,
-                    py_version=py_version)
+                    py_version=py_version,
+                )
             else:
                 url = get_release_wheel_url(
                     ray_commit=ray.__commit__,
                     sys_platform=sys_platform,
                     ray_version=ray.__version__,
-                    py_version=py_version)
+                    py_version=py_version,
+                )
             if requests.head(url).status_code != 200:
                 print("URL not found (yet?):", url)
                 retry.add(url)
@@ -63,9 +62,11 @@ if __name__ == "__main__":
     MAX_NUM_RETRIES = 12
 
     while retry and num_retries < MAX_NUM_RETRIES:
-        print(f"There are {len(retry)} URLs to retry. Sleeping 10 minutes "
-              f"to give some time for wheels to be built. "
-              f"Trial {num_retries + 1}/{MAX_NUM_RETRIES}.")
+        print(
+            f"There are {len(retry)} URLs to retry. Sleeping 10 minutes "
+            f"to give some time for wheels to be built. "
+            f"Trial {num_retries + 1}/{MAX_NUM_RETRIES}."
+        )
         print("List of URLs to retry:", retry)
         time.sleep(600)
         print("Retrying now...")

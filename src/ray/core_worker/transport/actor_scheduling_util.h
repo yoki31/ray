@@ -27,16 +27,17 @@ namespace core {
 class InboundRequest {
  public:
   InboundRequest();
-  InboundRequest(std::function<void(rpc::SendReplyCallback)> accept_callback,
-                 std::function<void(rpc::SendReplyCallback)> reject_callback,
-                 std::function<void(rpc::SendReplyCallback)> steal_callback,
-                 rpc::SendReplyCallback send_reply_callback, TaskID task_id,
-                 bool has_dependencies, const std::string &concurrency_group_name,
-                 const ray::FunctionDescriptor &function_descriptor);
+  InboundRequest(
+      std::function<void(rpc::SendReplyCallback)> accept_callback,
+      std::function<void(const Status &, rpc::SendReplyCallback)> reject_callback,
+      rpc::SendReplyCallback send_reply_callback,
+      TaskID task_id,
+      bool has_dependencies,
+      const std::string &concurrency_group_name,
+      const ray::FunctionDescriptor &function_descriptor);
 
   void Accept();
-  void Cancel();
-  void Steal(rpc::StealTasksReply *reply);
+  void Cancel(const Status &status);
   bool CanExecute() const;
   ray::TaskID TaskID() const;
   const std::string &ConcurrencyGroupName() const;
@@ -45,8 +46,7 @@ class InboundRequest {
 
  private:
   std::function<void(rpc::SendReplyCallback)> accept_callback_;
-  std::function<void(rpc::SendReplyCallback)> reject_callback_;
-  std::function<void(rpc::SendReplyCallback)> steal_callback_;
+  std::function<void(const Status &, rpc::SendReplyCallback)> reject_callback_;
   rpc::SendReplyCallback send_reply_callback_;
 
   ray::TaskID task_id_;
@@ -77,7 +77,7 @@ class DependencyWaiterImpl : public DependencyWaiter {
 
  private:
   int64_t next_request_id_ = 0;
-  std::unordered_map<int64_t, std::function<void()>> requests_;
+  absl::flat_hash_map<int64_t, std::function<void()>> requests_;
   DependencyWaiterInterface &dependency_client_;
 };
 

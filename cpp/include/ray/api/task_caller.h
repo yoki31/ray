@@ -14,8 +14,10 @@
 
 #pragma once
 
+#include <ray/api/runtime_env.h>
 #include <ray/api/static_check.h>
 #include <ray/api/task_options.h>
+
 namespace ray {
 namespace internal {
 
@@ -50,6 +52,11 @@ class TaskCaller {
     return *this;
   }
 
+  TaskCaller &SetRuntimeEnv(const ray::RuntimeEnv &runtime_env) {
+    task_options_.serialized_runtime_env_info = runtime_env.SerializeToRuntimeEnvInfo();
+    return *this;
+  }
+
  private:
   RayRuntime *runtime_;
   RemoteFunctionHolder remote_function_holder_{};
@@ -72,14 +79,31 @@ template <typename F>
 template <typename... Args>
 ObjectRef<boost::callable_traits::return_type_t<F>> TaskCaller<F>::Remote(
     Args &&...args) {
-  StaticCheck<F, Args...>();
   CheckTaskOptions(task_options_.resources);
-  using ReturnType = boost::callable_traits::return_type_t<F>;
-  using ArgsTuple = RemoveReference_t<boost::callable_traits::args_t<F>>;
-  Arguments::WrapArgs<ArgsTuple>(&args_, std::make_index_sequence<sizeof...(Args)>{},
-                                 std::forward<Args>(args)...);
+
+  if constexpr (is_x_lang_v<F>) {
+    using ArgsTuple = std::tuple<Args...>;
+    Arguments::WrapArgs<ArgsTuple>(remote_function_holder_.lang_type,
+                                   &args_,
+                                   std::make_index_sequence<sizeof...(Args)>{},
+                                   std::forward<Args>(args)...);
+  } else {
+    StaticCheck<F, Args...>();
+    using ArgsTuple = RemoveReference_t<boost::callable_traits::args_t<F>>;
+    Arguments::WrapArgs<ArgsTuple>(remote_function_holder_.lang_type,
+                                   &args_,
+                                   std::make_index_sequence<sizeof...(Args)>{},
+                                   std::forward<Args>(args)...);
+  }
+
   auto returned_object_id = runtime_->Call(remote_function_holder_, args_, task_options_);
-  return ObjectRef<ReturnType>(returned_object_id);
+  using ReturnType = boost::callable_traits::return_type_t<F>;
+  auto return_ref = ObjectRef<ReturnType>(returned_object_id);
+  // The core worker will add an initial ref to each return ID to keep it in
+  // scope. Now that we've created the frontend ObjectRef, remove this initial
+  // ref.
+  runtime_->RemoveLocalReference(returned_object_id);
+  return return_ref;
 }
 }  // namespace internal
 }  // namespace ray

@@ -1,41 +1,24 @@
-import inspect
-import time
 import os
+import sys
+import time
+from unittest.mock import MagicMock
 
 import pytest
-import shutil
-import sys
-from unittest.mock import MagicMock, patch
-
-from typing import Callable, Union
 
 import ray
 from ray import tune
-from ray.rllib import _register_all
 from ray.cluster_utils import Cluster
-from ray._private.test_utils import run_string_as_driver_nonblocking
-from ray.tune import register_trainable
-from ray.tune.experiment import Experiment
+from ray.train import CheckpointConfig
+from ray.train._internal.storage import StorageContext
 from ray.tune.error import TuneError
-from ray.tune.suggest import BasicVariantGenerator
-from ray.tune.syncer import CloudSyncer, SyncerCallback, get_node_syncer
-from ray.tune.utils.trainable import TrainableUtil
-from ray.tune.trial import Trial
-from ray.tune.trial_runner import TrialRunner
-from ray.tune.utils.mock import (MockDurableTrainer, MockRemoteTrainer,
-                                 MockNodeSyncer, mock_storage_client,
-                                 MOCK_REMOTE_DIR)
-
-# Wait up to five seconds for placement groups when starting a trial
-os.environ["TUNE_PLACEMENT_GROUP_WAIT_S"] = "5"
-# Block for results even when placement groups are pending
-os.environ["TUNE_TRIAL_STARTUP_GRACE_PERIOD"] = "0"
-os.environ["TUNE_TRIAL_RESULT_WAIT_TIME_S"] = "9999"
+from ray.tune.execution.tune_controller import TuneController
+from ray.tune.experiment import Trial
+from ray.tune.search import BasicVariantGenerator
 
 
 def _check_trial_running(trial):
-    if trial.runner:
-        ray.get(trial.runner.get_info.remote())
+    if trial.temporary_state.ray_actor:
+        ray.get(trial.temporary_state.ray_actor.get_info.remote())
         return True
     return False
 
@@ -51,27 +34,13 @@ def _start_new_cluster():
         head_node_args={
             "num_cpus": 1,
             "_system_config": {
-                "num_heartbeats_timeout": 10
-            }
-        })
-    # Pytest doesn't play nicely with imports
-    register_trainable("__fake_remote", MockRemoteTrainer)
-    register_trainable("__fake_durable", MockDurableTrainer)
-    _register_all()
+                "health_check_initial_delay_ms": 0,
+                "health_check_period_ms": 1000,
+                "health_check_failure_threshold": 10,
+            },
+        },
+    )
     return cluster
-
-
-class _PerTrialSyncerCallback(SyncerCallback):
-    def __init__(
-            self,
-            get_sync_fn: Callable[["Trial"], Union[None, bool, Callable]]):
-        self._get_sync_fn = get_sync_fn
-        super(_PerTrialSyncerCallback, self).__init__(None)
-
-    def _create_trial_syncer(self, trial: "Trial"):
-        sync_fn = self._get_sync_fn(trial)
-        return get_node_syncer(
-            trial.logdir, remote_dir=trial.logdir, sync_function=sync_fn)
 
 
 @pytest.fixture
@@ -94,13 +63,12 @@ def start_connected_emptyhead_cluster():
         head_node_args={
             "num_cpus": 0,
             "_system_config": {
-                "num_heartbeats_timeout": 10
-            }
-        })
-    # Pytest doesn't play nicely with imports
-    _register_all()
-    register_trainable("__fake_remote", MockRemoteTrainer)
-    register_trainable("__fake_durable", MockDurableTrainer)
+                "health_check_initial_delay_ms": 0,
+                "health_check_period_ms": 1000,
+                "health_check_failure_threshold": 10,
+            },
+        },
+    )
     os.environ["TUNE_STATE_REFRESH_PERIOD"] = "0.1"
     yield cluster
     # The code after the yield will run as teardown code.
@@ -108,20 +76,36 @@ def start_connected_emptyhead_cluster():
     cluster.shutdown()
 
 
-def test_counting_resources(start_connected_cluster):
+@pytest.fixture
+def storage(tmp_path):
+    os.makedirs(tmp_path / "exp_name" / "trial_name", exist_ok=True)
+    yield StorageContext(
+        storage_path=str(tmp_path),
+        experiment_dir_name="exp_name",
+        trial_dir_name="trial_name",
+    )
+
+
+def test_counting_resources(start_connected_cluster, storage):
     """Tests that Tune accounting is consistent with actual cluster."""
 
     cluster = start_connected_cluster
     nodes = []
     assert ray.cluster_resources()["CPU"] == 1
-    runner = TrialRunner(BasicVariantGenerator())
-    kwargs = {"stopping_criterion": {"training_iteration": 10}}
+    runner = TuneController(search_alg=BasicVariantGenerator(), storage=storage)
+    kwargs = {
+        "stopping_criterion": {"training_iteration": 10},
+        "config": {"sleep": 1.5},
+        "storage": storage,
+    }
 
     trials = [Trial("__fake", **kwargs), Trial("__fake", **kwargs)]
     for t in trials:
         runner.add_trial(t)
 
-    runner.step()
+    while not any(t.status == Trial.RUNNING for t in trials):
+        runner.step()
+
     running_trials = _get_running_trials(runner)
     assert len(running_trials) == 1
     assert _check_trial_running(running_trials[0])
@@ -132,7 +116,10 @@ def test_counting_resources(start_connected_cluster):
     cluster.remove_node(nodes.pop())
     cluster.wait_for_nodes()
     assert ray.cluster_resources()["CPU"] == 1
-    runner.step()
+
+    while not any(t.status == Trial.RUNNING for t in trials):
+        runner.step()
+
     # Only 1 trial can be running due to resource limitation.
     assert sum(t.status == Trial.RUNNING for t in runner.get_trials()) == 1
 
@@ -141,54 +128,57 @@ def test_counting_resources(start_connected_cluster):
     cluster.wait_for_nodes()
     assert ray.cluster_resources()["CPU"] == 6
 
-    # This is to make sure that pg is ready for the previous pending trial,
-    # so that when runner.step() is called next, the trial can be started in
-    # the same event loop.
-    time.sleep(5)
-    runner.step()
-    assert sum(t.status == Trial.RUNNING for t in runner.get_trials()) == 2
+    while any(t.status == Trial.PENDING for t in trials):
+        runner.step()
+    assert sum(t.status == Trial.RUNNING for t in runner.get_trials()) == 2, [
+        t.status for t in trials
+    ]
 
 
-def test_trial_processed_after_node_failure(start_connected_emptyhead_cluster):
+def test_trial_processed_after_node_failure(start_connected_emptyhead_cluster, storage):
     """Tests that Tune processes a trial as failed if its node died."""
     cluster = start_connected_emptyhead_cluster
     node = cluster.add_node(num_cpus=1)
     cluster.wait_for_nodes()
 
-    runner = TrialRunner(BasicVariantGenerator())
+    runner = TuneController(search_alg=BasicVariantGenerator(), storage=storage)
     mock_process_failure = MagicMock(side_effect=runner._process_trial_failure)
     runner._process_trial_failure = mock_process_failure
+    # Disable recursion in magic mock when saving experiment state
+    runner.save_to_dir = lambda *args, **kwargs: None
 
-    runner.add_trial(Trial("__fake"))
-    runner.step()
-    runner.step()
+    runner.add_trial(Trial("__fake", storage=storage))
+    trial = runner.get_trials()[0]
+
+    while trial.status != Trial.RUNNING:
+        runner.step()
+
     assert not mock_process_failure.called
 
     cluster.remove_node(node)
-    runner.step()
-    if not mock_process_failure.called:
+    while not mock_process_failure.called:
         runner.step()
     assert mock_process_failure.called
 
 
-def test_remove_node_before_result(start_connected_emptyhead_cluster):
+def test_remove_node_before_result(start_connected_emptyhead_cluster, storage):
     """Tune continues when node is removed before trial returns."""
     cluster = start_connected_emptyhead_cluster
     node = cluster.add_node(num_cpus=1)
     cluster.wait_for_nodes()
 
-    runner = TrialRunner(BasicVariantGenerator())
+    runner = TuneController(search_alg=BasicVariantGenerator(), storage=storage)
     kwargs = {
-        "stopping_criterion": {
-            "training_iteration": 3
-        },
-        "checkpoint_freq": 2,
-        "max_failures": 2
+        "stopping_criterion": {"training_iteration": 3},
+        "checkpoint_config": CheckpointConfig(checkpoint_frequency=2),
+        "max_failures": 2,
+        "storage": storage,
     }
     trial = Trial("__fake", **kwargs)
     runner.add_trial(trial)
 
-    runner.step()  # Start trial, call _train once
+    while trial.status != Trial.RUNNING:
+        runner.step()
     running_trials = _get_running_trials(runner)
     assert len(running_trials) == 1
     assert _check_trial_running(running_trials[0])
@@ -199,123 +189,21 @@ def test_remove_node_before_result(start_connected_emptyhead_cluster):
     cluster.wait_for_nodes()
     assert ray.cluster_resources()["CPU"] == 1
 
-    # Process result: fetch data, invoke _train again
-    runner.step()
+    while not trial.last_result.get("training_iteration") == 1:
+        runner.step()
     assert trial.last_result.get("training_iteration") == 1
 
     # Process result: discover failure, recover, _train (from scratch)
-    runner.step()
+    while trial.status != Trial.TERMINATED:
+        runner.step()
 
-    runner.step()  # Process result, invoke _train
-    assert trial.last_result.get("training_iteration") == 1
-    runner.step()  # Process result, invoke _save
-    assert trial.last_result.get("training_iteration") == 2
-    # process save, invoke _train
-    runner.step()
-    # process result
-    runner.step()
-    assert trial.status == Trial.TERMINATED
+    assert trial.last_result.get("training_iteration") > 1
 
     with pytest.raises(TuneError):
         runner.step()
 
 
-@pytest.mark.parametrize("trainable_id", ["__fake", "__fake_durable"])
-def test_trial_migration(start_connected_emptyhead_cluster, trainable_id):
-    """Removing a node while cluster has space should migrate trial.
-
-    The trial state should also be consistent with the checkpoint.
-    """
-    cluster = start_connected_emptyhead_cluster
-    node = cluster.add_node(num_cpus=1)
-    cluster.wait_for_nodes()
-
-    syncer_callback = _PerTrialSyncerCallback(
-        lambda trial: trial.trainable_name == "__fake")
-    runner = TrialRunner(BasicVariantGenerator(), callbacks=[syncer_callback])
-    kwargs = {
-        "stopping_criterion": {
-            "training_iteration": 4
-        },
-        "checkpoint_freq": 2,
-        "max_failures": 2,
-    }
-
-    if trainable_id == "__fake_durable":
-        kwargs["remote_checkpoint_dir"] = MOCK_REMOTE_DIR
-
-    # Test recovery of trial that hasn't been checkpointed
-    t = Trial(trainable_id, **kwargs)
-    runner.add_trial(t)
-    runner.step()  # Start trial
-    runner.step()  # Process result
-    assert t.last_result
-    node2 = cluster.add_node(num_cpus=1)
-    cluster.remove_node(node)
-    cluster.wait_for_nodes()
-    # TODO(ujvl): Node failure does not propagate until a step after it
-    #  actually should. This is possibly a problem with `Cluster`.
-    runner.step()
-    runner.step()  # Recovery step
-
-    # TODO(rliaw): This assertion is not critical but will not pass
-    #   because checkpoint handling is messy and should be refactored
-    #   rather than hotfixed.
-    # assert t.last_result is None, "Trial result not restored correctly."
-
-    # Process result (x2), process save, process result (x2), process save
-    for _ in range(6):
-        runner.step()
-
-    assert t.status == Trial.TERMINATED, runner.debug_string()
-
-    # Test recovery of trial that has been checkpointed
-    t2 = Trial(trainable_id, **kwargs)
-    runner.add_trial(t2)
-    # Start trial, process result (x2), process save
-    for _ in range(4):
-        runner.step()
-    assert t2.has_checkpoint()
-    node3 = cluster.add_node(num_cpus=1)
-    cluster.remove_node(node2)
-    cluster.wait_for_nodes()
-    runner.step()  # Process result 3 + start and fail 4 result
-    runner.step()  # Dispatch restore
-    runner.step()  # Process restore
-    runner.step()  # Process result 5
-    if t2.status != Trial.TERMINATED:
-        runner.step()  # Process result 6, dispatch save
-        runner.step()  # Process save
-    assert t2.status == Trial.TERMINATED, runner.debug_string()
-
-    # Test recovery of trial that won't be checkpointed
-    kwargs = {
-        "stopping_criterion": {
-            "training_iteration": 3
-        },
-    }
-
-    if trainable_id == "__fake_durable":
-        kwargs["remote_checkpoint_dir"] = MOCK_REMOTE_DIR
-
-    t3 = Trial(trainable_id, **kwargs)
-    runner.add_trial(t3)
-    runner.step()  # Start trial
-    runner.step()  # Process result 1
-    cluster.add_node(num_cpus=1)
-    cluster.remove_node(node3)
-    cluster.wait_for_nodes()
-    runner.step()  # Error handling step
-    if t3.status != Trial.ERROR:
-        runner.step()
-    assert t3.status == Trial.ERROR, runner.debug_string()
-
-    with pytest.raises(TuneError):
-        runner.step()
-
-
-@pytest.mark.parametrize("trainable_id", ["__fake", "__fake_durable"])
-def test_trial_requeue(start_connected_emptyhead_cluster, trainable_id):
+def test_trial_requeue(start_connected_emptyhead_cluster, tmpdir, storage):
     """Removing a node in full cluster causes Trial to be requeued."""
     os.environ["TUNE_MAX_PENDING_TRIALS_PG"] = "1"
 
@@ -323,28 +211,23 @@ def test_trial_requeue(start_connected_emptyhead_cluster, trainable_id):
     node = cluster.add_node(num_cpus=1)
     cluster.wait_for_nodes()
 
-    syncer_callback = _PerTrialSyncerCallback(
-        lambda trial: trial.trainable_name == "__fake")
-    runner = TrialRunner(
-        BasicVariantGenerator(), callbacks=[syncer_callback])  # noqa
+    runner = TuneController(search_alg=BasicVariantGenerator(), storage=storage)
     kwargs = {
-        "stopping_criterion": {
-            "training_iteration": 5
-        },
-        "checkpoint_freq": 1,
+        "stopping_criterion": {"training_iteration": 5},
+        "checkpoint_config": CheckpointConfig(checkpoint_frequency=1),
         "max_failures": 1,
+        "storage": storage,
     }
 
-    if trainable_id == "__fake_durable":
-        kwargs["remote_checkpoint_dir"] = MOCK_REMOTE_DIR
-
-    trials = [Trial(trainable_id, **kwargs), Trial(trainable_id, **kwargs)]
+    trials = [Trial("__fake", **kwargs), Trial("__fake", **kwargs)]
     for t in trials:
         runner.add_trial(t)
 
-    runner.step()  # Start trial
-    runner.step()  # Process result, dispatch save
-    runner.step()  # Process save
+    while not any(t.status == Trial.RUNNING for t in trials):
+        runner.step()
+
+    runner.step()
+    runner.step()
 
     running_trials = _get_running_trials(runner)
     assert len(running_trials) == 1
@@ -354,181 +237,78 @@ def test_trial_requeue(start_connected_emptyhead_cluster, trainable_id):
     time.sleep(0.1)  # Sleep so that next step() refreshes cluster resources
     runner.step()  # Process result, dispatch save
     runner.step()  # Process save (detect error), requeue trial
-    assert all(
-        t.status == Trial.PENDING for t in trials), runner.debug_string()
+    assert all(t.status == Trial.PENDING for t in trials)
 
 
-@pytest.mark.parametrize("trainable_id", ["__fake_remote", "__fake_durable"])
-def test_migration_checkpoint_removal(start_connected_emptyhead_cluster,
-                                      trainable_id):
+def test_migration_checkpoint_removal(
+    start_connected_emptyhead_cluster, tmpdir, storage
+):
     """Test checks that trial restarts if checkpoint is lost w/ node fail."""
     cluster = start_connected_emptyhead_cluster
     node = cluster.add_node(num_cpus=1)
     cluster.wait_for_nodes()
 
-    class _SyncerCallback(SyncerCallback):
-        def _create_trial_syncer(self, trial: "Trial"):
-            client = mock_storage_client()
-            return MockNodeSyncer(trial.logdir, trial.logdir, client)
-
-    syncer_callback = _SyncerCallback(None)
-    runner = TrialRunner(BasicVariantGenerator(), callbacks=[syncer_callback])
+    runner = TuneController(search_alg=BasicVariantGenerator(), storage=storage)
     kwargs = {
-        "stopping_criterion": {
-            "training_iteration": 4
-        },
-        "checkpoint_freq": 2,
+        "stopping_criterion": {"training_iteration": 4},
+        "checkpoint_config": CheckpointConfig(checkpoint_frequency=2),
         "max_failures": 2,
+        "storage": storage,
     }
 
-    if trainable_id == "__fake_durable":
-        kwargs["remote_checkpoint_dir"] = MOCK_REMOTE_DIR
+    # Test recovery of trial that has been checkpointed
+    t1 = Trial("__fake", **kwargs)
+    runner.add_trial(t1)
 
-    # The following patches only affect __fake_remote.
-    def hide_remote_path(path_function):
-        def hidden_path_func(checkpoint_path):
-            """Converts back to local path first."""
-            if MOCK_REMOTE_DIR in checkpoint_path:
-                checkpoint_path = checkpoint_path[len(MOCK_REMOTE_DIR):]
-                checkpoint_path = os.path.join("/", checkpoint_path)
-            return path_function(checkpoint_path)
+    # Start trial, process result (x2), process save
+    while not t1.has_checkpoint():
+        runner.step()
 
-        return hidden_path_func
-
-    trainable_util = "ray.tune.ray_trial_executor.TrainableUtil"
-    _find_ckpt = trainable_util + ".find_checkpoint_dir"
-    find_func = TrainableUtil.find_checkpoint_dir
-    _pickle_ckpt = trainable_util + ".pickle_checkpoint"
-    pickle_func = TrainableUtil.pickle_checkpoint
-
-    with patch(_find_ckpt) as mock_find, patch(_pickle_ckpt) as mock_pkl_ckpt:
-        # __fake_remote trainables save to a separate "remote" directory.
-        # TrainableUtil will not check this path unless we mock it.
-        mock_find.side_effect = hide_remote_path(find_func)
-        mock_pkl_ckpt.side_effect = hide_remote_path(pickle_func)
-
-        # Test recovery of trial that has been checkpointed
-        t1 = Trial(trainable_id, **kwargs)
-        runner.add_trial(t1)
-
-        # Start trial, process result (x2), process save
-        for _ in range(4):
-            runner.step()
-        assert t1.has_checkpoint()
-
-        cluster.add_node(num_cpus=1)
-        cluster.remove_node(node)
-        cluster.wait_for_nodes()
-        shutil.rmtree(os.path.dirname(t1.checkpoint.value))
-        runner.step()  # Collect result 3, kick off + fail result 4
-        runner.step()  # Dispatch restore
-        runner.step()  # Process restore + step 4
-        for _ in range(3):
-            if t1.status != Trial.TERMINATED:
-                runner.step()
-    assert t1.status == Trial.TERMINATED, runner.debug_string()
-
-
-@pytest.mark.skip(reason="Not very consistent.")
-@pytest.mark.parametrize("trainable_id", ["__fake", "__fake_durable"])
-def test_cluster_down_simple(start_connected_cluster, tmpdir, trainable_id):
-    """Tests that TrialRunner save/restore works on cluster shutdown."""
-    cluster = start_connected_cluster
     cluster.add_node(num_cpus=1)
+    cluster.remove_node(node)
     cluster.wait_for_nodes()
 
-    dirpath = str(tmpdir)
-    syncer_callback = _PerTrialSyncerCallback(
-        lambda trial: trial.trainable_name == "__fake")
-    runner = TrialRunner(
-        local_checkpoint_dir=dirpath,
-        checkpoint_period=0,
-        callbacks=[syncer_callback])
-    kwargs = {
-        "stopping_criterion": {
-            "training_iteration": 2
-        },
-        "checkpoint_freq": 1,
-        "max_failures": 1,
-    }
-
-    if trainable_id == "__fake_durable":
-        kwargs["remote_checkpoint_dir"] = MOCK_REMOTE_DIR
-
-    trials = [Trial(trainable_id, **kwargs), Trial(trainable_id, **kwargs)]
-    for t in trials:
-        runner.add_trial(t)
-
-    # Start trial (x2), process result, process save
-    for _ in range(4):
+    while not runner.is_finished():
         runner.step()
-    assert all(t.status == Trial.RUNNING for t in runner.get_trials())
-    runner.checkpoint()
-
-    ray.shutdown()
-    cluster.shutdown()
-
-    cluster = _start_new_cluster()
-    runner = TrialRunner(resume="LOCAL", local_checkpoint_dir=dirpath)
-    # Start trial, process restore, process result, process save
-    for _ in range(4):
-        runner.step()
-
-    # Start trial 2, process result, process save, process result, process save
-    for i in range(5):
-        runner.step()
-
-    with pytest.raises(TuneError):
-        runner.step()
-
-    assert all(t.status == Trial.TERMINATED for t in runner.get_trials())
-    ray.shutdown()
-    cluster.shutdown()
+    assert t1.status == Trial.TERMINATED
 
 
-@pytest.mark.parametrize("trainable_id", ["__fake", "__fake_durable"])
-def test_cluster_down_full(start_connected_cluster, tmpdir, trainable_id):
+def test_cluster_down_full(start_connected_cluster, tmpdir):
     """Tests that run_experiment restoring works on cluster shutdown."""
     cluster = start_connected_cluster
-    dirpath = str(tmpdir)
 
-    use_default_sync = trainable_id == "__fake"
-    from ray.tune.result import DEFAULT_RESULTS_DIR
-    local_dir = DEFAULT_RESULTS_DIR
-    upload_dir = None if use_default_sync else MOCK_REMOTE_DIR
-
-    base_dict = dict(
-        run=trainable_id,
-        stop=dict(training_iteration=3),
-        local_dir=local_dir,
-        sync_config=dict(upload_dir=upload_dir, syncer=use_default_sync))
+    base_dict = dict(run="__fake", stop=dict(training_iteration=3))
 
     exp1_args = base_dict
-    exp2_args = dict(base_dict.items(), local_dir=dirpath, checkpoint_freq=1)
+    exp2_args = dict(
+        base_dict.items(),
+        checkpoint_config=CheckpointConfig(checkpoint_frequency=1),
+    )
     exp3_args = dict(base_dict.items(), config=dict(mock_error=True))
     exp4_args = dict(
-        base_dict.items(), config=dict(mock_error=True), checkpoint_freq=1)
+        base_dict.items(),
+        config=dict(mock_error=True),
+        checkpoint_config=CheckpointConfig(checkpoint_frequency=1),
+    )
 
     all_experiments = {
         "exp1": exp1_args,
         "exp2": exp2_args,
         "exp3": exp3_args,
-        "exp4": exp4_args
+        "exp4": exp4_args,
     }
 
-    mock_get_client = "ray.tune.trial_runner.get_cloud_syncer"
-    with patch(mock_get_client) as mock_get_cloud_syncer:
-        mock_syncer = CloudSyncer(local_dir, upload_dir, mock_storage_client())
-        mock_get_cloud_syncer.return_value = mock_syncer
+    tune.run_experiments(all_experiments, raise_on_failed_trial=False)
 
-        tune.run_experiments(all_experiments, raise_on_failed_trial=False)
+    ray.shutdown()
+    cluster.shutdown()
+    cluster = _start_new_cluster()
 
-        ray.shutdown()
-        cluster.shutdown()
-        cluster = _start_new_cluster()
-
-        trials = tune.run_experiments(
-            all_experiments, resume=True, raise_on_failed_trial=False)
+    trials = tune.run_experiments(
+        all_experiments,
+        resume=True,
+        raise_on_failed_trial=False,
+    )
 
     assert len(trials) == 4
     assert all(t.status in [Trial.TERMINATED, Trial.ERROR] for t in trials)
@@ -536,175 +316,7 @@ def test_cluster_down_full(start_connected_cluster, tmpdir, trainable_id):
     cluster.shutdown()
 
 
-@pytest.mark.skip(reason="Not very consistent.")
-def test_cluster_rllib_restore(start_connected_cluster, tmpdir):
-    cluster = start_connected_cluster
-    dirpath = str(tmpdir)
-    script = """
-import time
-import ray
-from ray import tune
-
-ray.init(address="{address}")
-
-
-tune.run(
-    "PG",
-    name="experiment",
-    config=dict(env="CartPole-v1", framework="tf"),
-    stop=dict(training_iteration=10),
-    local_dir="{checkpoint_dir}",
-    checkpoint_freq=1,
-    max_failures=1,
-    dict(experiment=kwargs),
-    raise_on_failed_trial=False)
-""".format(
-        address=cluster.address, checkpoint_dir=dirpath)
-    run_string_as_driver_nonblocking(script)
-    # Wait until the right checkpoint is saved.
-    # The trainable returns every 0.5 seconds, so this should not miss
-    # the checkpoint.
-    local_checkpoint_dir = os.path.join(dirpath, "experiment")
-    for i in range(100):
-        if TrialRunner.checkpoint_exists(local_checkpoint_dir):
-            # Inspect the internal trialrunner
-            runner = TrialRunner(
-                resume="LOCAL", local_checkpoint_dir=local_checkpoint_dir)
-            trials = runner.get_trials()
-            last_res = trials[0].last_result
-            if last_res and last_res.get("training_iteration"):
-                break
-        time.sleep(0.3)
-
-    if not TrialRunner.checkpoint_exists(local_checkpoint_dir):
-        raise RuntimeError("Checkpoint file didn't appear.")
-
-    ray.shutdown()
-    cluster.shutdown()
-    cluster = _start_new_cluster()
-    cluster.wait_for_nodes()
-
-    # Restore properly from checkpoint
-    trials2 = tune.run_experiments(
-        {
-            "experiment": {
-                "run": "PG",
-                "checkpoint_freq": 1,
-                "local_dir": dirpath,
-            }
-        },
-        resume=True)
-    assert all(t.status == Trial.TERMINATED for t in trials2)
-    ray.shutdown()
-    cluster.shutdown()
-
-
-# TODO(ujvl): Fix test.
-@pytest.mark.skip(reason="Not very consistent.")
-def test_cluster_interrupt(start_connected_cluster, tmpdir):
-    """Tests run_experiment on cluster shutdown with actual interrupt.
-
-    This is an end-to-end test.
-    """
-    cluster = start_connected_cluster
-    dirpath = str(tmpdir)
-
-    # Needs to be in scope for pytest
-    class _Mock(tune.Trainable):
-        """Finishes on the 4th iteration."""
-
-        def setup(self, config):
-            self.state = {"hi": 0}
-
-        def step(self):
-            self.state["hi"] += 1
-            time.sleep(0.5)
-            return {"done": self.state["hi"] >= 4}
-
-        def save_checkpoint(self, path):
-            return self.state
-
-        def load_checkpoint(self, state):
-            self.state = state
-
-    # Removes indent from class.
-    reformatted = "\n".join(line[4:] if len(line) else line
-                            for line in inspect.getsource(_Mock).split("\n"))
-
-    script = """
-import os
-import time
-import ray
-from ray import tune
-
-os.environ["TUNE_GLOBAL_CHECKPOINT_S"] = "0"
-
-ray.init(address="{address}")
-
-{fail_class_code}
-
-tune.run(
-    {fail_class},
-    name="experiment",
-    stop=dict(training_iteration=5),
-    local_dir="{checkpoint_dir}",
-    checkpoint_freq=1,
-    max_failures=1,
-    raise_on_failed_trial=False)
-""".format(
-        address=cluster.address,
-        checkpoint_dir=dirpath,
-        fail_class_code=reformatted,
-        fail_class=_Mock.__name__)
-    run_string_as_driver_nonblocking(script)
-
-    # Wait until the right checkpoint is saved.
-    # The trainable returns every 0.5 seconds, so this should not miss
-    # the checkpoint.
-    local_checkpoint_dir = os.path.join(dirpath, "experiment")
-    for i in range(50):
-        if TrialRunner.checkpoint_exists(local_checkpoint_dir):
-            # Inspect the internal trialrunner
-            runner = TrialRunner(
-                resume="LOCAL", local_checkpoint_dir=local_checkpoint_dir)
-            trials = runner.get_trials()
-            last_res = trials[0].last_result
-            if last_res and last_res.get("training_iteration") == 3:
-                break
-        time.sleep(0.2)
-
-    if not TrialRunner.checkpoint_exists(local_checkpoint_dir):
-        raise RuntimeError("Checkpoint file didn't appear.")
-
-    ray.shutdown()
-    cluster.shutdown()
-    cluster = _start_new_cluster()
-    Experiment.register_if_needed(_Mock)
-
-    # Inspect the internal trialrunner
-    runner = TrialRunner(
-        resume="LOCAL", local_checkpoint_dir=local_checkpoint_dir)
-    trials = runner.get_trials()
-    assert trials[0].last_result["training_iteration"] == 3
-    assert trials[0].status == Trial.PENDING
-
-    # Restore properly from checkpoint
-    trials2 = tune.run_experiments(
-        {
-            "experiment": {
-                "run": _Mock,
-                "local_dir": dirpath,
-                "checkpoint_freq": 1
-            }
-        },
-        resume=True,
-        raise_on_failed_trial=False)
-    assert all(t.status == Trial.TERMINATED for t in trials2)
-    assert {t.trial_id for t in trials2} == {t.trial_id for t in trials}
-    ray.shutdown()
-    cluster.shutdown()
-
-
 if __name__ == "__main__":
     import pytest
-    sys.exit(pytest.main(["-v", __file__]))
+
+    sys.exit(pytest.main(["-v", "--reruns", "3", __file__]))

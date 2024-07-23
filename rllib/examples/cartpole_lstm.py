@@ -1,125 +1,93 @@
+# @OldAPIStack
+
+# TODO (sven): Move this script to `examples/rl_modules/...`
+
 import argparse
 import os
 
-from ray.rllib.examples.env.stateless_cartpole import StatelessCartPole
+from ray.air.constants import TRAINING_ITERATION
+from ray.rllib.examples.envs.classes.stateless_cartpole import StatelessCartPole
+from ray.rllib.utils.metrics import (
+    ENV_RUNNER_RESULTS,
+    EPISODE_RETURN_MEAN,
+    NUM_ENV_STEPS_SAMPLED_LIFETIME,
+)
 from ray.rllib.utils.test_utils import check_learning_achieved
+from ray.tune.registry import get_trainable_cls
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--run",
-    type=str,
-    default="PPO",
-    help="The RLlib-registered algorithm to use.")
+    "--run", type=str, default="PPO", help="The RLlib-registered algorithm to use."
+)
 parser.add_argument("--num-cpus", type=int, default=0)
 parser.add_argument(
     "--framework",
-    choices=["tf", "tf2", "tfe", "torch"],
-    default="tf",
-    help="The DL framework specifier.")
-parser.add_argument("--eager-tracing", action="store_true")
+    choices=["tf", "tf2", "torch"],
+    default="torch",
+    help="The DL framework specifier.",
+)
 parser.add_argument("--use-prev-action", action="store_true")
 parser.add_argument("--use-prev-reward", action="store_true")
 parser.add_argument(
     "--as-test",
     action="store_true",
     help="Whether this script should be run as a test: --stop-reward must "
-    "be achieved within --stop-timesteps AND --stop-iters.")
+    "be achieved within --stop-timesteps AND --stop-iters.",
+)
 parser.add_argument(
-    "--stop-iters",
-    type=int,
-    default=200,
-    help="Number of iterations to train.")
+    "--stop-iters", type=int, default=200, help="Number of iterations to train."
+)
 parser.add_argument(
-    "--stop-timesteps",
-    type=int,
-    default=100000,
-    help="Number of timesteps to train.")
+    "--stop-timesteps", type=int, default=100000, help="Number of timesteps to train."
+)
 parser.add_argument(
-    "--stop-reward",
-    type=float,
-    default=150.0,
-    help="Reward at which we stop training.")
+    "--stop-reward", type=float, default=150.0, help="Reward at which we stop training."
+)
 
 if __name__ == "__main__":
     import ray
-    from ray import tune
+    from ray import air, tune
 
     args = parser.parse_args()
 
-    ray.init(num_cpus=args.num_cpus or None)
+    ray.init()
 
-    configs = {
-        "PPO": {
-            "num_sgd_iter": 5,
-            "model": {
-                "vf_share_layers": True,
-            },
-            "vf_loss_coeff": 0.0001,
-        },
-        "IMPALA": {
-            "num_workers": 2,
-            "num_gpus": 0,
-            "vf_loss_coeff": 0.01,
-        },
-    }
+    algo_cls = get_trainable_cls(args.run)
+    config = algo_cls.get_default_config()
 
-    config = dict(
-        configs[args.run],
-        **{
-            "env": StatelessCartPole,
-            # Use GPUs iff `RLLIB_NUM_GPUS` env var set to > 0.
-            "num_gpus": int(os.environ.get("RLLIB_NUM_GPUS", "0")),
-            "model": {
-                "use_lstm": True,
-                "lstm_cell_size": 256,
-                "lstm_use_prev_action": args.use_prev_action,
-                "lstm_use_prev_reward": args.use_prev_reward,
-            },
-            "framework": args.framework,
-            # Run with tracing enabled for tfe/tf2?
-            "eager_tracing": args.eager_tracing,
-        })
+    config.environment(env=StatelessCartPole).resources(
+        num_gpus=int(os.environ.get("RLLIB_NUM_GPUS", "0"))
+    ).framework(args.framework).reporting(min_time_s_per_iteration=0.1).training(
+        model={
+            "use_lstm": True,
+            "lstm_cell_size": 32,
+            "lstm_use_prev_action": args.use_prev_action,
+            "lstm_use_prev_reward": args.use_prev_reward,
+        }
+    )
+
+    if args.run == "PPO":
+        config.training(num_sgd_iter=5, vf_loss_coeff=0.0001, train_batch_size=512)
+        config.model["vf_share_layers"] = True
+    elif args.run == "IMPALA":
+        config.env_runners(num_env_runners=2)
+        config.resources(num_gpus=0)
+        config.training(vf_loss_coeff=0.01)
 
     stop = {
-        "training_iteration": args.stop_iters,
-        "timesteps_total": args.stop_timesteps,
-        "episode_reward_mean": args.stop_reward,
+        TRAINING_ITERATION: args.stop_iters,
+        NUM_ENV_STEPS_SAMPLED_LIFETIME: args.stop_timesteps,
+        f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": args.stop_reward,
     }
 
-    # To run the Trainer without tune.run, using our LSTM model and
-    # manual state-in handling, do the following:
-
-    # Example (use `config` from the above code):
-    # >> import numpy as np
-    # >> from ray.rllib.agents.ppo import PPOTrainer
-    # >>
-    # >> trainer = PPOTrainer(config)
-    # >> lstm_cell_size = config["model"]["lstm_cell_size"]
-    # >> env = StatelessCartPole()
-    # >> obs = env.reset()
-    # >>
-    # >> # range(2) b/c h- and c-states of the LSTM.
-    # >> init_state = state = [
-    # ..     np.zeros([lstm_cell_size], np.float32) for _ in range(2)
-    # .. ]
-    # >> prev_a = 0
-    # >> prev_r = 0.0
-    # >>
-    # >> while True:
-    # >>     a, state_out, _ = trainer.compute_single_action(
-    # ..         obs, state, prev_a, prev_r)
-    # >>     obs, reward, done, _ = env.step(a)
-    # >>     if done:
-    # >>         obs = env.reset()
-    # >>         state = init_state
-    # >>         prev_a = 0
-    # >>         prev_r = 0.0
-    # >>     else:
-    # >>         state = state_out
-    # >>         prev_a = a
-    # >>         prev_r = reward
-
-    results = tune.run(args.run, config=config, stop=stop, verbose=2)
+    tuner = tune.Tuner(
+        args.run,
+        param_space=config.to_dict(),
+        run_config=air.RunConfig(
+            stop=stop,
+        ),
+    )
+    results = tuner.fit()
 
     if args.as_test:
         check_learning_achieved(results, args.stop_reward)

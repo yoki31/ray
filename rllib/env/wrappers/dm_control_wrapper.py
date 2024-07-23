@@ -24,7 +24,8 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
-from gym import core, spaces
+from gymnasium import core, spaces
+
 try:
     from dm_env import specs
 except ImportError:
@@ -32,17 +33,20 @@ except ImportError:
 try:
     # Suppress MuJoCo warning (dm_control uses absl logging).
     import absl.logging
+
     absl.logging.set_verbosity("error")
     from dm_control import suite
 except (ImportError, OSError):
     suite = None
 import numpy as np
 
+from ray.rllib.utils.annotations import PublicAPI
+
 
 def _spec_to_box(spec):
     def extract_min_max(s):
         assert s.dtype == np.float64 or s.dtype == np.float32
-        dim = np.int(np.prod(s.shape))
+        dim = np.int_(np.prod(s.shape))
         if type(s) == specs.Array:
             bound = np.inf * np.ones(dim, dtype=np.float32)
             return -bound, bound
@@ -69,20 +73,23 @@ def _flatten_obs(obs):
     return np.concatenate(obs_pieces, axis=0)
 
 
+@PublicAPI
 class DMCEnv(core.Env):
-    def __init__(self,
-                 domain_name,
-                 task_name,
-                 task_kwargs=None,
-                 visualize_reward=False,
-                 from_pixels=False,
-                 height=64,
-                 width=64,
-                 camera_id=0,
-                 frame_skip=2,
-                 environment_kwargs=None,
-                 channels_first=True,
-                 preprocess=True):
+    def __init__(
+        self,
+        domain_name,
+        task_name,
+        task_kwargs=None,
+        visualize_reward=False,
+        from_pixels=False,
+        height=64,
+        width=64,
+        camera_id=0,
+        frame_skip=2,
+        environment_kwargs=None,
+        channels_first=True,
+        preprocess=True,
+    ):
         self._from_pixels = from_pixels
         self._height = height
         self._width = width
@@ -92,15 +99,21 @@ class DMCEnv(core.Env):
         self.preprocess = preprocess
 
         if specs is None:
-            raise RuntimeError((
-                "The `specs` module from `dm_env` was not imported. Make sure "
-                "`dm_env` is installed and visible in the current python "
-                "environment."))
+            raise RuntimeError(
+                (
+                    "The `specs` module from `dm_env` was not imported. Make sure "
+                    "`dm_env` is installed and visible in the current python "
+                    "environment."
+                )
+            )
         if suite is None:
             raise RuntimeError(
-                ("The `suite` module from `dm_control` was not imported. Make "
-                 "sure `dm_control` is installed and visible in the current "
-                 "python enviornment."))
+                (
+                    "The `suite` module from `dm_control` was not imported. Make "
+                    "sure `dm_control` is installed and visible in the current "
+                    "python enviornment."
+                )
+            )
 
         # create task
         self._env = suite.load(
@@ -108,28 +121,29 @@ class DMCEnv(core.Env):
             task_name=task_name,
             task_kwargs=task_kwargs,
             visualize_reward=visualize_reward,
-            environment_kwargs=environment_kwargs)
+            environment_kwargs=environment_kwargs,
+        )
 
         # true and normalized action spaces
         self._true_action_space = _spec_to_box([self._env.action_spec()])
         self._norm_action_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=self._true_action_space.shape,
-            dtype=np.float32)
+            low=-1.0, high=1.0, shape=self._true_action_space.shape, dtype=np.float32
+        )
 
         # create observation space
         if from_pixels:
-            shape = [3, height,
-                     width] if channels_first else [height, width, 3]
+            shape = [3, height, width] if channels_first else [height, width, 3]
             self._observation_space = spaces.Box(
-                low=0, high=255, shape=shape, dtype=np.uint8)
+                low=0, high=255, shape=shape, dtype=np.uint8
+            )
             if preprocess:
                 self._observation_space = spaces.Box(
-                    low=-0.5, high=0.5, shape=shape, dtype=np.float32)
+                    low=-0.5, high=0.5, shape=shape, dtype=np.float32
+                )
         else:
             self._observation_space = _spec_to_box(
-                self._env.observation_spec().values())
+                self._env.observation_spec().values()
+            )
 
         self._state_space = _spec_to_box(self._env.observation_spec().values())
 
@@ -141,16 +155,15 @@ class DMCEnv(core.Env):
     def _get_obs(self, time_step):
         if self._from_pixels:
             obs = self.render(
-                height=self._height,
-                width=self._width,
-                camera_id=self._camera_id)
+                height=self._height, width=self._width, camera_id=self._camera_id
+            )
             if self._channels_first:
                 obs = obs.transpose(2, 0, 1).copy()
             if self.preprocess:
                 obs = obs / 255.0 - 0.5
         else:
             obs = _flatten_obs(time_step.observation)
-        return obs
+        return obs.astype(np.float32)
 
     def _convert_action(self, action):
         action = action.astype(np.float64)
@@ -177,30 +190,31 @@ class DMCEnv(core.Env):
         assert self._norm_action_space.contains(action)
         action = self._convert_action(action)
         assert self._true_action_space.contains(action)
-        reward = 0
+        reward = 0.0
         extra = {"internal_state": self._env.physics.get_state().copy()}
 
+        terminated = truncated = False
         for _ in range(self._frame_skip):
             time_step = self._env.step(action)
-            reward += time_step.reward or 0
-            done = time_step.last()
-            if done:
+            reward += time_step.reward or 0.0
+            terminated = False
+            truncated = time_step.last()
+            if terminated or truncated:
                 break
         obs = self._get_obs(time_step)
         self.current_state = _flatten_obs(time_step.observation)
         extra["discount"] = time_step.discount
-        return obs, reward, done, extra
+        return obs, reward, terminated, truncated, extra
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
         time_step = self._env.reset()
         self.current_state = _flatten_obs(time_step.observation)
         obs = self._get_obs(time_step)
-        return obs
+        return obs, {}
 
     def render(self, mode="rgb_array", height=None, width=None, camera_id=0):
         assert mode == "rgb_array", "only support for rgb_array mode"
         height = height or self._height
         width = width or self._width
         camera_id = camera_id or self._camera_id
-        return self._env.physics.render(
-            height=height, width=width, camera_id=camera_id)
+        return self._env.physics.render(height=height, width=width, camera_id=camera_id)

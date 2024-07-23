@@ -1,6 +1,8 @@
-import ray
-
 import os
+
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -8,14 +10,11 @@ import torch.utils.data
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
-import numpy as np
-
+from scipy.stats import entropy
 from torch.autograd import Variable
 from torch.nn import functional as F
-from scipy.stats import entropy
 
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+import ray
 
 # Training parameters
 workers = 2
@@ -47,15 +46,19 @@ def get_data_loader(data_dir="~/data"):
     dataset = dset.MNIST(
         root=data_dir,
         download=True,
-        transform=transforms.Compose([
-            transforms.Resize(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, ), (0.5, )),
-        ]))
+        transform=transforms.Compose(
+            [
+                transforms.Resize(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5,), (0.5,)),
+            ]
+        ),
+    )
 
     # Create the dataloader
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, num_workers=workers)
+        dataset, batch_size=batch_size, shuffle=True, num_workers=workers
+    )
 
     return dataloader
 
@@ -87,7 +90,8 @@ class Generator(nn.Module):
             nn.BatchNorm2d(ngf),
             nn.ReLU(True),
             nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
-            nn.Tanh())
+            nn.Tanh(),
+        )
 
     def forward(self, input):
         return self.main(input)
@@ -100,10 +104,14 @@ class Discriminator(nn.Module):
             nn.Conv2d(nc, ndf, 4, 2, 1, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 2), nn.LeakyReLU(0.2, inplace=True),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 4), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf * 4, 1, 4, 1, 0, bias=False), nn.Sigmoid())
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 4, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid(),
+        )
 
     def forward(self, input):
         return self.main(input)
@@ -153,12 +161,12 @@ def inception_score(imgs, mnist_model_ref, batch_size=32, splits=1):
         batch = batch.type(dtype)
         batchv = Variable(batch)
         batch_size_i = batch.size()[0]
-        preds[i * batch_size:i * batch_size + batch_size_i] = get_pred(batchv)
+        preds[i * batch_size : i * batch_size + batch_size_i] = get_pred(batchv)
 
     # Now compute the mean kl-div
     split_scores = []
     for k in range(splits):
-        part = preds[k * (N // splits):(k + 1) * (N // splits), :]
+        part = preds[k * (N // splits) : (k + 1) * (N // splits), :]
         py = np.mean(part, axis=0)
         scores = []
         for i in range(part.shape[0]):
@@ -172,8 +180,17 @@ def inception_score(imgs, mnist_model_ref, batch_size=32, splits=1):
 # __INCEPTION_SCORE_end__
 
 
-def train(netD, netG, optimG, optimD, criterion, dataloader, iteration, device,
-          mnist_model_ref):
+def train_func(
+    netD,
+    netG,
+    optimG,
+    optimD,
+    criterion,
+    dataloader,
+    iteration,
+    device,
+    mnist_model_ref,
+):
     real_label = 1
     fake_label = 0
 
@@ -184,8 +201,7 @@ def train(netD, netG, optimG, optimD, criterion, dataloader, iteration, device,
         netD.zero_grad()
         real_cpu = data[0].to(device)
         b_size = real_cpu.size(0)
-        label = torch.full(
-            (b_size, ), real_label, dtype=torch.float, device=device)
+        label = torch.full((b_size,), real_label, dtype=torch.float, device=device)
         output = netD(real_cpu).view(-1)
         errD_real = criterion(output, label)
         errD_real.backward()
@@ -213,10 +229,20 @@ def train(netD, netG, optimG, optimD, criterion, dataloader, iteration, device,
 
         # Output training stats
         if iteration % 10 == 0:
-            print("[%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z))"
-                  ": %.4f / %.4f \tInception score: %.4f" %
-                  (iteration, len(dataloader), errD.item(), errG.item(), D_x,
-                   D_G_z1, D_G_z2, is_score))
+            print(
+                "[%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z))"
+                ": %.4f / %.4f \tInception score: %.4f"
+                % (
+                    iteration,
+                    len(dataloader),
+                    errD.item(),
+                    errG.item(),
+                    D_x,
+                    D_G_z1,
+                    D_G_z2,
+                    is_score,
+                )
+            )
 
     return errG.item(), errD.item(), is_score
 
@@ -229,8 +255,10 @@ def plot_images(dataloader):
     plt.title("Original Images")
     plt.imshow(
         np.transpose(
-            vutils.make_grid(real_batch[0][:64], padding=2,
-                             normalize=True).cpu(), (1, 2, 0)))
+            vutils.make_grid(real_batch[0][:64], padding=2, normalize=True).cpu(),
+            (1, 2, 0),
+        )
+    )
 
     plt.show()
 
@@ -238,18 +266,20 @@ def plot_images(dataloader):
 def demo_gan(checkpoint_paths):
     img_list = []
     fixed_noise = torch.randn(64, nz, 1, 1)
-    for netG_path in checkpoint_paths:
+    for path in checkpoint_paths:
+        checkpoint_dict = torch.load(os.path.join(path, "checkpoint.pt"))
+
         loadedG = Generator()
-        loadedG.load_state_dict(torch.load(netG_path)["netGmodel"])
+        loadedG.load_state_dict(checkpoint_dict["netGmodel"])
         with torch.no_grad():
             fake = loadedG(fixed_noise).detach().cpu()
         img_list.append(vutils.make_grid(fake, padding=2, normalize=True))
 
     fig = plt.figure(figsize=(8, 8))
     plt.axis("off")
-    ims = [[plt.imshow(np.transpose(i, (1, 2, 0)), animated=True)]
-           for i in img_list]
+    ims = [[plt.imshow(np.transpose(i, (1, 2, 0)), animated=True)] for i in img_list]
     ani = animation.ArtistAnimation(
-        fig, ims, interval=1000, repeat_delay=1000, blit=True)
+        fig, ims, interval=1000, repeat_delay=1000, blit=True
+    )
     ani.save("./generated.gif", writer="imagemagick", dpi=72)
     plt.show()

@@ -11,11 +11,28 @@
 # ray.init(address=args.address)
 
 # __quick_start_begin__
-from ray import tune
+from ray import train, tune
 
 
+def objective(config):  # <1>
+    score = config["a"] ** 2 + config["b"]
+    return {"score": score}
+
+
+search_space = {  # <2>
+    "a": tune.grid_search([0.001, 0.01, 0.1, 1.0]),
+    "b": tune.choice([1, 2, 3]),
+}
+
+tuner = tune.Tuner(objective, param_space=search_space)  # <3>
+
+results = tuner.fit()
+print(results.get_best_result(metric="score", mode="min").config)
+# __quick_start_end__
+
+# __ml_quick_start_begin__
 def objective(step, alpha, beta):
-    return (0.1 + alpha * step / 100)**(-1) + beta * 0.1
+    return (0.1 + alpha * step / 100) ** (-1) + beta * 0.1
 
 
 def training_function(config):
@@ -25,19 +42,20 @@ def training_function(config):
         # Iterative training function - can be any arbitrary training procedure.
         intermediate_score = objective(step, alpha, beta)
         # Feed the score back back to Tune.
-        tune.report(mean_loss=intermediate_score)
+        train.report({"mean_loss": intermediate_score})
 
 
-analysis = tune.run(
+tuner = tune.Tuner(
     training_function,
-    config={
+    param_space={
         "alpha": tune.grid_search([0.001, 0.01, 0.1]),
-        "beta": tune.choice([1, 2, 3])
-    })
+        "beta": tune.choice([1, 2, 3]),
+    },
+)
+results = tuner.fit()
 
-print("Best config: ", analysis.get_best_config(
-    metric="mean_loss", mode="min"))
+print("Best config: ", results.get_best_result(metric="mean_loss", mode="min").config)
 
 # Get a dataframe for analyzing trial results.
-df = analysis.results_df
-# __quick_start_end__
+df = results.get_dataframe()
+# __ml_quick_start_end__

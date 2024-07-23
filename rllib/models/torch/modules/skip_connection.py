@@ -1,3 +1,4 @@
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.typing import TensorType
 from typing import Optional
@@ -5,6 +6,7 @@ from typing import Optional
 torch, nn = try_import_torch()
 
 
+@OldAPIStack
 class SkipConnection(nn.Module):
     """Skip connection layer.
 
@@ -12,10 +14,9 @@ class SkipConnection(nn.Module):
     input as hidden state input to a given fan_in_layer.
     """
 
-    def __init__(self,
-                 layer: nn.Module,
-                 fan_in_layer: Optional[nn.Module] = None,
-                 **kwargs):
+    def __init__(
+        self, layer: nn.Module, fan_in_layer: Optional[nn.Module] = None, **kwargs
+    ):
         """Initializes a SkipConnection nn Module object.
 
         Args:

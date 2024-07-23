@@ -28,8 +28,10 @@
 *ray*rpc*
 *ray*gcs*
 *ray*CoreWorker*
-*ray*PeriodicalRunner*;
+*ray*PeriodicalRunner*
+*ray*internal*
 *PyInit__raylet*
 *Java_io_ray*
 _JNI_On*
-*ray*streaming*
+*aligned_free*
+*aligned_malloc*

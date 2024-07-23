@@ -1,24 +1,24 @@
-from gym.spaces import Space
+from gymnasium.spaces import Space
 from typing import Dict, List, Optional, Union, TYPE_CHECKING
 
 from ray.rllib.env.base_env import BaseEnv
 from ray.rllib.models.action_dist import ActionDistribution
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.utils.annotations import DeveloperAPI
-from ray.rllib.utils.deprecation import Deprecated
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.framework import try_import_torch, TensorType
-from ray.rllib.utils.typing import LocalOptimizer, TrainerConfigDict
+from ray.rllib.utils.typing import LocalOptimizer, AlgorithmConfigDict
 
 if TYPE_CHECKING:
     from ray.rllib.policy.policy import Policy
     from ray.rllib.utils import try_import_tf
+
     _, tf, _ = try_import_tf()
 
 _, nn = try_import_torch()
 
 
-@DeveloperAPI
+@OldAPIStack
 class Exploration:
     """Implements an exploration strategy for Policies.
 
@@ -27,9 +27,16 @@ class Exploration:
     implemented exploration schema.
     """
 
-    def __init__(self, action_space: Space, *, framework: str,
-                 policy_config: TrainerConfigDict, model: ModelV2,
-                 num_workers: int, worker_index: int):
+    def __init__(
+        self,
+        action_space: Space,
+        *,
+        framework: str,
+        policy_config: AlgorithmConfigDict,
+        model: ModelV2,
+        num_workers: int,
+        worker_index: int
+    ):
         """
         Args:
             action_space: The action space in which to explore.
@@ -53,14 +60,14 @@ class Exploration:
             if params:
                 self.device = params[0].device
 
-    @DeveloperAPI
     def before_compute_actions(
-            self,
-            *,
-            timestep: Optional[Union[TensorType, int]] = None,
-            explore: Optional[Union[TensorType, bool]] = None,
-            tf_sess: Optional["tf.Session"] = None,
-            **kwargs):
+        self,
+        *,
+        timestep: Optional[Union[TensorType, int]] = None,
+        explore: Optional[Union[TensorType, bool]] = None,
+        tf_sess: Optional["tf.Session"] = None,
+        **kwargs
+    ):
         """Hook for preparations before policy.compute_actions() is called.
 
         Args:
@@ -71,10 +78,9 @@ class Exploration:
         """
         pass
 
-    # yapf: disable
+    # fmt: off
     # __sphinx_doc_begin_get_exploration_action__
 
-    @DeveloperAPI
     def get_exploration_action(self,
                                *,
                                action_distribution: ActionDistribution,
@@ -103,15 +109,16 @@ class Exploration:
         pass
 
     # __sphinx_doc_end_get_exploration_action__
-    # yapf: enable
+    # fmt: on
 
-    @DeveloperAPI
-    def on_episode_start(self,
-                         policy: "Policy",
-                         *,
-                         environment: BaseEnv = None,
-                         episode: int = None,
-                         tf_sess: Optional["tf.Session"] = None):
+    def on_episode_start(
+        self,
+        policy: "Policy",
+        *,
+        environment: BaseEnv = None,
+        episode: int = None,
+        tf_sess: Optional["tf.Session"] = None
+    ):
         """Handles necessary exploration logic at the beginning of an episode.
 
         Args:
@@ -122,13 +129,14 @@ class Exploration:
         """
         pass
 
-    @DeveloperAPI
-    def on_episode_end(self,
-                       policy: "Policy",
-                       *,
-                       environment: BaseEnv = None,
-                       episode: int = None,
-                       tf_sess: Optional["tf.Session"] = None):
+    def on_episode_end(
+        self,
+        policy: "Policy",
+        *,
+        environment: BaseEnv = None,
+        episode: int = None,
+        tf_sess: Optional["tf.Session"] = None
+    ):
         """Handles necessary exploration logic at the end of an episode.
 
         Args:
@@ -139,11 +147,12 @@ class Exploration:
         """
         pass
 
-    @DeveloperAPI
-    def postprocess_trajectory(self,
-                               policy: "Policy",
-                               sample_batch: SampleBatch,
-                               tf_sess: Optional["tf.Session"] = None):
+    def postprocess_trajectory(
+        self,
+        policy: "Policy",
+        sample_batch: SampleBatch,
+        tf_sess: Optional["tf.Session"] = None,
+    ):
         """Handles post-processing of done episode trajectories.
 
         Changes the given batch in place. This callback is invoked by the
@@ -156,9 +165,9 @@ class Exploration:
         """
         return sample_batch
 
-    @DeveloperAPI
-    def get_exploration_optimizer(self, optimizers: List[LocalOptimizer]) -> \
-            List[LocalOptimizer]:
+    def get_exploration_optimizer(
+        self, optimizers: List[LocalOptimizer]
+    ) -> List[LocalOptimizer]:
         """May add optimizer(s) to the Policy's own `optimizers`.
 
         The number of optimizers (Policy's plus Exploration's optimizers) must
@@ -174,9 +183,7 @@ class Exploration:
         """
         return optimizers
 
-    @DeveloperAPI
-    def get_state(self, sess: Optional["tf.Session"] = None) -> \
-            Dict[str, TensorType]:
+    def get_state(self, sess: Optional["tf.Session"] = None) -> Dict[str, TensorType]:
         """Returns the current exploration state.
 
         Args:
@@ -187,9 +194,7 @@ class Exploration:
         """
         return {}
 
-    @DeveloperAPI
-    def set_state(self, state: object,
-                  sess: Optional["tf.Session"] = None) -> None:
+    def set_state(self, state: object, sess: Optional["tf.Session"] = None) -> None:
         """Sets the Exploration object's state to the given values.
 
         Note that some exploration components are stateless, even though they
@@ -202,7 +207,3 @@ class Exploration:
             sess: An optional tf Session object to use.
         """
         pass
-
-    @Deprecated(new="get_state", error=False)
-    def get_info(self, sess: Optional["tf.Session"] = None):
-        return self.get_state(sess)

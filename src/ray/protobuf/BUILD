@@ -7,8 +7,10 @@ load("@rules_proto_grpc//python:defs.bzl", "python_grpc_compile")
 proto_library(
     name = "common_proto",
     srcs = ["common.proto"],
-    deps = [":runtime_env_common_proto"],
     visibility = ["//java:__subpackages__"],
+    deps = [
+        ":runtime_env_common_proto",
+    ],
 )
 
 cc_proto_library(
@@ -32,9 +34,34 @@ proto_library(
 )
 
 proto_library(
+    name = "instance_manager_proto",
+    srcs = ["experimental/instance_manager.proto"],
+)
+
+python_grpc_compile(
+    name = "instance_manager_py_proto",
+    deps = [":instance_manager_proto"],
+)
+
+cc_proto_library(
+    name = "instance_manager_cc_proto",
+    deps = [":instance_manager_proto"],
+)
+
+proto_library(
     name = "runtime_env_common_proto",
     srcs = ["runtime_env_common.proto"],
     visibility = ["//java:__subpackages__"],
+)
+
+proto_library(
+    name = "ray_syncer_proto",
+    srcs = ["ray_syncer.proto"],
+)
+
+cc_proto_library(
+    name = "ray_syncer_cc_proto",
+    deps = [":ray_syncer_proto"],
 )
 
 cc_proto_library(
@@ -88,8 +115,9 @@ proto_library(
     name = "node_manager_proto",
     srcs = ["node_manager.proto"],
     deps = [
-      ":common_proto",
-      ":gcs_proto",
+        ":autoscaler_proto",
+        ":common_proto",
+        ":gcs_proto",
     ],
 )
 
@@ -108,7 +136,7 @@ proto_library(
     srcs = ["reporter.proto"],
     deps = [
         ":common_proto",
-        "@io_opencensus_proto//opencensus/proto/metrics/v1:metrics_proto"
+        "@io_opencensus_proto//opencensus/proto/metrics/v1:metrics_proto",
     ],
 )
 
@@ -281,8 +309,9 @@ proto_library(
     name = "runtime_env_agent_proto",
     srcs = ["runtime_env_agent.proto"],
     deps = [
-        ":common_proto",
         ":agent_manager_proto",
+        ":common_proto",
+        ":runtime_env_common_proto",
     ],
 )
 
@@ -305,4 +334,34 @@ proto_library(
 python_grpc_compile(
     name = "serve_py_proto",
     deps = [":serve_proto"],
+)
+
+proto_library(
+    name = "usage_proto",
+    srcs = ["usage.proto"],
+)
+
+python_grpc_compile(
+    name = "usage_py_proto",
+    deps = [":usage_proto"],
+)
+
+cc_proto_library(
+    name = "usage_cc_proto",
+    deps = [":usage_proto"],
+)
+
+proto_library(
+    name = "autoscaler_proto",
+    srcs = ["autoscaler.proto"],
+)
+
+python_grpc_compile(
+    name = "autoscaler_py_proto",
+    deps = [":autoscaler_proto"],
+)
+
+cc_proto_library(
+    name = "autoscaler_cc_proto",
+    deps = [":autoscaler_proto"],
 )

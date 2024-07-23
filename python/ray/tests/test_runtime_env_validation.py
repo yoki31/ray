@@ -5,15 +5,18 @@ import tempfile
 from pathlib import Path
 from ray import job_config
 import yaml
+import jsonschema
 
 from ray._private.runtime_env.validation import (
-    parse_and_validate_excludes, parse_and_validate_working_dir,
-    parse_and_validate_conda, parse_and_validate_pip,
-    parse_and_validate_env_vars, parse_and_validate_py_modules,
-    ParsedRuntimeEnv)
-from ray._private.runtime_env.pip import RAY_RUNTIME_ENV_ALLOW_RAY_IN_PIP
-from ray._private.runtime_env.plugin import (decode_plugin_uri,
-                                             encode_plugin_uri)
+    parse_and_validate_excludes,
+    parse_and_validate_working_dir,
+    parse_and_validate_conda,
+    parse_and_validate_pip,
+    parse_and_validate_env_vars,
+    parse_and_validate_py_modules,
+)
+from ray._private.runtime_env.plugin_schema_manager import RuntimeEnvPluginSchemaManager
+from ray.runtime_env import RuntimeEnv
 
 CONDA_DICT = {"dependencies": ["pip", {"pip": ["pip-install-test==0.5"]}]}
 
@@ -45,19 +48,8 @@ def test_directory():
 
 
 def test_key_with_value_none():
-    runtime_env_dict = {"pip": None}
-    parsed_runtime_env = ParsedRuntimeEnv(runtime_env_dict)
+    parsed_runtime_env = RuntimeEnv(pip=None)
     assert parsed_runtime_env == {}
-
-
-def test_encode_plugin_uri():
-    assert encode_plugin_uri("plugin", "uri") == "plugin|uri"
-
-
-def test_decode_plugin_uri():
-    with pytest.raises(ValueError):
-        decode_plugin_uri("no_vertical_bar_separator")
-    assert decode_plugin_uri("plugin|uri") == ("plugin", "uri")
 
 
 class TestValidateWorkingDir:
@@ -71,18 +63,20 @@ class TestValidateWorkingDir:
 
     def test_validate_remote_invalid_extensions(self):
         for uri in [
-                "https://some_domain.com/path/file", "s3://bucket/file",
-                "gs://bucket/file"
+            "https://some_domain.com/path/file",
+            "s3://bucket/file",
+            "gs://bucket/file",
         ]:
             with pytest.raises(
-                    ValueError,
-                    match="Only .zip files supported for remote URIs."):
+                ValueError, match="Only .zip or .whl files supported for remote URIs."
+            ):
                 parse_and_validate_working_dir(uri)
 
     def test_validate_remote_valid_input(self):
         for uri in [
-                "https://some_domain.com/path/file.zip",
-                "s3://bucket/file.zip", "gs://bucket/file.zip"
+            "https://some_domain.com/path/file.zip",
+            "s3://bucket/file.zip",
+            "gs://bucket/file.zip",
         ]:
             working_dir = parse_and_validate_working_dir(uri)
             assert working_dir == uri
@@ -103,18 +97,23 @@ class TestValidatePyModules:
 
     def test_validate_remote_invalid_extension(self):
         uris = [
-            "https://some_domain.com/path/file", "s3://bucket/file",
-            "gs://bucket/file"
+            "https://some_domain.com/path/file",
+            "s3://bucket/file",
+            "gs://bucket/file",
         ]
         with pytest.raises(
-                ValueError,
-                match="Only .zip files supported for remote URIs."):
+            ValueError, match="Only .zip or .whl files supported for remote URIs."
+        ):
             parse_and_validate_py_modules(uris)
 
     def test_validate_remote_valid_input(self):
         uris = [
-            "https://some_domain.com/path/file.zip", "s3://bucket/file.zip",
-            "gs://bucket/file.zip"
+            "https://some_domain.com/path/file.zip",
+            "s3://bucket/file.zip",
+            "gs://bucket/file.zip",
+            "https://some_domain.com/path/file.whl",
+            "s3://bucket/file.whl",
+            "gs://bucket/file.whl",
         ]
         py_modules = parse_and_validate_py_modules(uris)
         assert py_modules == uris
@@ -135,11 +134,9 @@ class TestValidateExcludes:
             parse_and_validate_excludes(["string", 1])
 
     def test_validate_excludes_empty_list(self):
-        assert ParsedRuntimeEnv({"excludes": []}) == {}
+        assert RuntimeEnv(excludes=[]) == {}
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32", reason="Conda option not supported on Windows.")
 class TestValidateConda:
     def test_validate_conda_invalid_types(self):
         with pytest.raises(TypeError):
@@ -178,8 +175,6 @@ class TestValidateConda:
         assert parse_and_validate_conda(CONDA_DICT) == CONDA_DICT
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32", reason="Pip option not supported on Windows.")
 class TestValidatePip:
     def test_validate_pip_invalid_types(self):
         with pytest.raises(TypeError):
@@ -200,28 +195,21 @@ class TestValidatePip:
             requirements_file = requirements_file.resolve()
 
         result = parse_and_validate_pip(str(requirements_file))
-        assert result == PIP_LIST
+        assert result["packages"] == PIP_LIST
+        assert not result["pip_check"]
+        assert "pip_version" not in result
 
     def test_validate_pip_valid_list(self):
         result = parse_and_validate_pip(PIP_LIST)
-        assert result == PIP_LIST
+        assert result["packages"] == PIP_LIST
+        assert not result["pip_check"]
+        assert "pip_version" not in result
 
-    def test_remove_ray(self):
+    def test_validate_ray(self):
         result = parse_and_validate_pip(["pkg1", "ray", "pkg2"])
-        assert result == ["pkg1", "pkg2"]
-
-    def test_remove_ray_env_var(self, monkeypatch):
-        monkeypatch.setenv(RAY_RUNTIME_ENV_ALLOW_RAY_IN_PIP, "1")
-        result = parse_and_validate_pip(["pkg1", "ray", "pkg2"])
-        assert result == ["pkg1", "ray", "pkg2"]
-
-    def test_replace_ray_libraries_with_dependencies(self):
-        result = parse_and_validate_pip(["pkg1", "ray[serve, tune]", "pkg2"])
-        assert "pkg1" in result
-        assert "pkg2" in result
-        assert "uvicorn" in result  # from ray[serve]
-        assert "pandas" in result  # from ray[tune]
-        assert not any(["ray" in specifier for specifier in result])
+        assert result["packages"] == ["pkg1", "ray", "pkg2"]
+        assert not result["pip_check"]
+        assert "pip_version" not in result
 
 
 class TestValidateEnvVars:
@@ -233,29 +221,24 @@ class TestValidateEnvVars:
         with pytest.raises(TypeError, match=".*Dict[str, str]*"):
             parse_and_validate_env_vars({1: "hi"})
 
+        with pytest.raises(TypeError, match=".*value 123 is of type <class 'int'>*"):
+            parse_and_validate_env_vars({"hi": 123})
+
+        with pytest.raises(TypeError, match=".*value True is of type <class 'bool'>*"):
+            parse_and_validate_env_vars({"hi": True})
+
+        with pytest.raises(TypeError, match=".*key 1.23 is of type <class 'float'>*"):
+            parse_and_validate_env_vars({1.23: "hi"})
+
 
 class TestParsedRuntimeEnv:
     def test_empty(self):
-        assert ParsedRuntimeEnv({}) == {}
+        assert RuntimeEnv() == {}
 
-    @pytest.mark.skipif(
-        sys.platform == "win32", reason="Pip option not supported on Windows.")
     def test_serialization(self):
-        env1 = ParsedRuntimeEnv({
-            "pip": ["requests"],
-            "env_vars": {
-                "hi1": "hi1",
-                "hi2": "hi2"
-            }
-        })
+        env1 = RuntimeEnv(pip=["requests"], env_vars={"hi1": "hi1", "hi2": "hi2"})
 
-        env2 = ParsedRuntimeEnv({
-            "env_vars": {
-                "hi2": "hi2",
-                "hi1": "hi1"
-            },
-            "pip": ["requests"]
-        })
+        env2 = RuntimeEnv(env_vars={"hi2": "hi2", "hi1": "hi1"}, pip=["requests"])
 
         assert env1 == env2
 
@@ -265,49 +248,44 @@ class TestParsedRuntimeEnv:
         # Key ordering shouldn't matter.
         assert serialized_env1 == serialized_env2
 
-        deserialized_env1 = ParsedRuntimeEnv.deserialize(serialized_env1)
-        deserialized_env2 = ParsedRuntimeEnv.deserialize(serialized_env2)
+        deserialized_env1 = RuntimeEnv.deserialize(serialized_env1)
+        deserialized_env2 = RuntimeEnv.deserialize(serialized_env2)
 
         assert env1 == deserialized_env1 == env2 == deserialized_env2
 
     def test_reject_pip_and_conda(self):
         with pytest.raises(ValueError):
-            ParsedRuntimeEnv({"pip": ["requests"], "conda": "env_name"})
+            RuntimeEnv(pip=["requests"], conda="env_name")
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="Conda and pip options not supported on Windows.")
     def test_ray_commit_injection(self):
         # Should not be injected if no pip and conda.
-        result = ParsedRuntimeEnv({"env_vars": {"hi": "hi"}})
+        result = RuntimeEnv(env_vars={"hi": "hi"})
         assert "_ray_commit" not in result
 
         # Should be injected if pip or conda present.
-        result = ParsedRuntimeEnv({
-            "pip": ["requests"],
-        })
+        result = RuntimeEnv(pip=["requests"])
         assert "_ray_commit" in result
 
-        result = ParsedRuntimeEnv({"conda": "env_name"})
+        result = RuntimeEnv(conda="env_name")
         assert "_ray_commit" in result
 
         # Should not override if passed.
-        result = ParsedRuntimeEnv({"conda": "env_name", "_ray_commit": "Blah"})
+        result = RuntimeEnv(conda="env_name", _ray_commit="Blah")
         assert result["_ray_commit"] == "Blah"
 
     def test_inject_current_ray(self):
         # Should not be injected if not provided by env var.
-        result = ParsedRuntimeEnv({"env_vars": {"hi": "hi"}})
+        result = RuntimeEnv(env_vars={"hi": "hi"})
         assert "_inject_current_ray" not in result
 
         os.environ["RAY_RUNTIME_ENV_LOCAL_DEV_MODE"] = "1"
 
         # Should be injected if provided by env var.
-        result = ParsedRuntimeEnv({})
+        result = RuntimeEnv()
         assert result["_inject_current_ray"]
 
         # Should be preserved if passed.
-        result = ParsedRuntimeEnv({"_inject_current_ray": False})
+        result = RuntimeEnv(_inject_current_ray=False)
         assert not result["_inject_current_ray"]
 
         del os.environ["RAY_RUNTIME_ENV_LOCAL_DEV_MODE"]
@@ -321,5 +299,98 @@ class TestParseJobConfig:
         assert config.metadata == {}
 
 
+schemas_dir = os.path.dirname(__file__)
+test_env_1 = os.path.join(
+    os.path.dirname(__file__), "test_runtime_env_validation_1_schema.json"
+)
+test_env_2 = os.path.join(
+    os.path.dirname(__file__), "test_runtime_env_validation_2_schema.json"
+)
+test_env_invalid_path = os.path.join(
+    os.path.dirname(__file__), "test_runtime_env_validation_non_existent.json"
+)
+test_env_bad_json = os.path.join(
+    os.path.dirname(__file__), "test_runtime_env_validation_bad_2_schema.json"
+)
+
+
+@pytest.mark.parametrize(
+    "set_runtime_env_plugin_schemas",
+    [
+        schemas_dir,
+        f"{test_env_1},{test_env_2}",
+        # Test with an invalid JSON file first in the list
+        f"{test_env_bad_json},{test_env_1},{test_env_2}",
+        # Test with a non-existent JSON file
+        f"{test_env_invalid_path},{test_env_1},{test_env_2}",
+    ],
+    indirect=True,
+)
+@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
+class TestValidateByJsonSchema:
+    def test_validate_pip(self, set_runtime_env_plugin_schemas):
+        runtime_env = RuntimeEnv()
+        runtime_env.set("pip", {"packages": ["requests"], "pip_check": True})
+        with pytest.raises(jsonschema.exceptions.ValidationError, match="pip_check"):
+            runtime_env.set("pip", {"packages": ["requests"], "pip_check": "1"})
+        runtime_env["pip"] = {"packages": ["requests"], "pip_check": True}
+        with pytest.raises(jsonschema.exceptions.ValidationError, match="pip_check"):
+            runtime_env["pip"] = {"packages": ["requests"], "pip_check": "1"}
+
+    def test_validate_working_dir(self, set_runtime_env_plugin_schemas):
+        runtime_env = RuntimeEnv()
+        runtime_env.set("working_dir", "https://abc/file.zip")
+        with pytest.raises(jsonschema.exceptions.ValidationError, match="working_dir"):
+            runtime_env.set("working_dir", ["https://abc/file.zip"])
+        runtime_env["working_dir"] = "https://abc/file.zip"
+        with pytest.raises(jsonschema.exceptions.ValidationError, match="working_dir"):
+            runtime_env["working_dir"] = ["https://abc/file.zip"]
+
+    def test_validate_test_env_1(self, set_runtime_env_plugin_schemas):
+        runtime_env = RuntimeEnv()
+        runtime_env.set("test_env_1", {"array": ["123"], "bool": True})
+        with pytest.raises(jsonschema.exceptions.ValidationError, match="bool"):
+            runtime_env.set("test_env_1", {"array": ["123"], "bool": "1"})
+
+    def test_validate_test_env_2(self, set_runtime_env_plugin_schemas):
+        runtime_env = RuntimeEnv()
+        runtime_env.set("test_env_2", "123")
+        with pytest.raises(jsonschema.exceptions.ValidationError, match="test_env_2"):
+            runtime_env.set("test_env_2", ["123"])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
+class TestRuntimeEnvPluginSchemaManager:
+    def test(self):
+        RuntimeEnvPluginSchemaManager.clear()
+        # No schemas when starts.
+        assert len(RuntimeEnvPluginSchemaManager.schemas) == 0
+        # When the `validate` is used first time, the schemas will be loaded lazily.
+        # The validation of pip is enabled.
+        with pytest.raises(jsonschema.exceptions.ValidationError, match="pip_check"):
+            RuntimeEnvPluginSchemaManager.validate(
+                "pip", {"packages": ["requests"], "pip_check": "123"}
+            )
+        # The validation of test_env_1 is disabled because we haven't set the env var.
+        RuntimeEnvPluginSchemaManager.validate(
+            "test_env_1", {"array": ["123"], "bool": "123"}
+        )
+        assert len(RuntimeEnvPluginSchemaManager.schemas) != 0
+        # Set the thirdparty schemas.
+        os.environ["RAY_RUNTIME_ENV_PLUGIN_SCHEMAS"] = schemas_dir
+        # clear the loaded schemas to make sure the schemas chould be reloaded next
+        # time.
+        RuntimeEnvPluginSchemaManager.clear()
+        assert len(RuntimeEnvPluginSchemaManager.schemas) == 0
+        # The validation of test_env_1 is enabled.
+        with pytest.raises(jsonschema.exceptions.ValidationError, match="bool"):
+            RuntimeEnvPluginSchemaManager.validate(
+                "test_env_1", {"array": ["123"], "bool": "123"}
+            )
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-sv", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

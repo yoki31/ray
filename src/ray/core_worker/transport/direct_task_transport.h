@@ -53,23 +53,42 @@ typedef int RuntimeEnvHash;
 using SchedulingKey =
     std::tuple<SchedulingClass, std::vector<ObjectID>, ActorID, RuntimeEnvHash>;
 
+// Interface that controls the max concurrent pending lease requests
+// per scheduling category.
+class LeaseRequestRateLimiter {
+ public:
+  virtual size_t GetMaxPendingLeaseRequestsPerSchedulingCategory() = 0;
+  virtual ~LeaseRequestRateLimiter() = default;
+};
+
+// Lease request rate-limiter with fixed number.
+class StaticLeaseRequestRateLimiter : public LeaseRequestRateLimiter {
+ public:
+  StaticLeaseRequestRateLimiter(size_t limit) : kLimit(limit) {}
+  size_t GetMaxPendingLeaseRequestsPerSchedulingCategory() override { return kLimit; }
+
+ private:
+  const size_t kLimit;
+};
+
 // This class is thread-safe.
 class CoreWorkerDirectTaskSubmitter {
  public:
   explicit CoreWorkerDirectTaskSubmitter(
-      rpc::Address rpc_address, std::shared_ptr<WorkerLeaseInterface> lease_client,
+      rpc::Address rpc_address,
+      std::shared_ptr<WorkerLeaseInterface> lease_client,
       std::shared_ptr<rpc::CoreWorkerClientPool> core_worker_client_pool,
       LeaseClientFactoryFn lease_client_factory,
       std::shared_ptr<LeasePolicyInterface> lease_policy,
       std::shared_ptr<CoreWorkerMemoryStore> store,
-      std::shared_ptr<TaskFinisherInterface> task_finisher, NodeID local_raylet_id,
-      WorkerType worker_type, int64_t lease_timeout_ms,
-      std::shared_ptr<ActorCreatorInterface> actor_creator, const JobID &job_id,
-      uint32_t max_tasks_in_flight_per_worker =
-          ::RayConfig::instance().max_tasks_in_flight_per_worker(),
-      absl::optional<boost::asio::steady_timer> cancel_timer = absl::nullopt,
-      uint64_t max_pending_lease_requests_per_scheduling_category =
-          ::RayConfig::instance().max_pending_lease_requests_per_scheduling_category())
+      std::shared_ptr<TaskFinisherInterface> task_finisher,
+      NodeID local_raylet_id,
+      WorkerType worker_type,
+      int64_t lease_timeout_ms,
+      std::shared_ptr<ActorCreatorInterface> actor_creator,
+      const JobID &job_id,
+      std::shared_ptr<LeaseRequestRateLimiter> lease_request_rate_limiter,
+      absl::optional<boost::asio::steady_timer> cancel_timer = absl::nullopt)
       : rpc_address_(rpc_address),
         local_lease_client_(lease_client),
         lease_client_factory_(lease_client_factory),
@@ -82,9 +101,7 @@ class CoreWorkerDirectTaskSubmitter {
         actor_creator_(actor_creator),
         client_cache_(core_worker_client_pool),
         job_id_(job_id),
-        max_tasks_in_flight_per_worker_(max_tasks_in_flight_per_worker),
-        max_pending_lease_requests_per_scheduling_category_(
-            max_pending_lease_requests_per_scheduling_category),
+        lease_request_rate_limiter_(lease_request_rate_limiter),
         cancel_retry_timer_(std::move(cancel_timer)) {}
 
   /// Schedule a task for direct submission to a worker.
@@ -98,8 +115,14 @@ class CoreWorkerDirectTaskSubmitter {
   /// \param[in] force_kill Whether to kill the worker executing the task.
   Status CancelTask(TaskSpecification task_spec, bool force_kill, bool recursive);
 
-  Status CancelRemoteTask(const ObjectID &object_id, const rpc::Address &worker_addr,
-                          bool force_kill, bool recursive);
+  /// Request the owner of the object ID to cancel a request.
+  /// It is used when a object ID is not owned by the current process.
+  /// We cannot cancel the task in this case because we don't have enough
+  /// information to cancel a task.
+  Status CancelRemoteTask(const ObjectID &object_id,
+                          const rpc::Address &worker_addr,
+                          bool force_kill,
+                          bool recursive);
   /// Check that the scheduling_key_entries_ hashmap is empty by calling the private
   /// CheckNoSchedulingKeyEntries function after acquiring the lock.
   bool CheckNoSchedulingKeyEntriesPublic() {
@@ -127,25 +150,32 @@ class CoreWorkerDirectTaskSubmitter {
   /// \param[in] addr The address of the worker.
   /// \param[in] task_queue_key The scheduling class of the worker.
   /// \param[in] was_error Whether the task failed to be submitted.
+  /// \param[in] error_detail The reason why it was errored.
+  /// It is unused if was_error is false.
+  /// \param[in] worker_exiting Whether the worker is exiting.
   /// \param[in] assigned_resources Resource ids previously assigned to the worker.
   void OnWorkerIdle(
-      const rpc::WorkerAddress &addr, const SchedulingKey &task_queue_key, bool was_error,
+      const rpc::Address &addr,
+      const SchedulingKey &task_queue_key,
+      bool was_error,
+      const std::string &error_detail,
+      bool worker_exiting,
       const google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry> &assigned_resources)
-      EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Get an existing lease client or connect a new one. If a raylet_address is
   /// provided, this connects to a remote raylet. Else, this connects to the
   /// local raylet.
   std::shared_ptr<WorkerLeaseInterface> GetOrConnectLeaseClient(
-      const rpc::Address *raylet_address) EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      const rpc::Address *raylet_address) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Report worker backlog information to the local raylet
-  void ReportWorkerBacklogInternal() EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ReportWorkerBacklogInternal() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Report backlog if the backlog size is changed for this scheduling key
   /// since last report
   void ReportWorkerBacklogIfNeeded(const SchedulingKey &scheduling_key)
-      EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Request a new worker from the raylet if no such requests are currently in
   /// flight and there are tasks queued. If a raylet address is provided, then
@@ -153,65 +183,57 @@ class CoreWorkerDirectTaskSubmitter {
   /// worker should be requested from the local raylet.
   void RequestNewWorkerIfNeeded(const SchedulingKey &task_queue_key,
                                 const rpc::Address *raylet_address = nullptr)
-      EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Cancel a pending worker lease and retry until the cancellation succeeds
   /// (i.e., the raylet drops the request). This should be called when there
   /// are no more tasks queued with the given scheduling key and there is an
   /// in-flight lease request for that key.
   void CancelWorkerLeaseIfNeeded(const SchedulingKey &scheduling_key)
-      EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Set up client state for newly granted worker lease.
   void AddWorkerLeaseClient(
-      const rpc::WorkerAddress &addr, std::shared_ptr<WorkerLeaseInterface> lease_client,
+      const rpc::Address &addr,
+      std::shared_ptr<WorkerLeaseInterface> lease_client,
       const google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry> &assigned_resources,
-      const SchedulingKey &scheduling_key) EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      const SchedulingKey &scheduling_key,
+      const TaskID &task_id) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// This function takes care of returning a worker to the Raylet.
   /// \param[in] addr The address of the worker.
   /// \param[in] was_error Whether the task failed to be submitted.
-  void ReturnWorker(const rpc::WorkerAddress addr, bool was_error,
-                    const SchedulingKey &scheduling_key) EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  /// \param[in] error_detail The reason why it was errored.
+  /// it is unused if was_error is false.
+  /// \param[in] worker_exiting Whether the worker is exiting.
+  void ReturnWorker(const rpc::Address addr,
+                    bool was_error,
+                    const std::string &error_detail,
+                    bool worker_exiting,
+                    const SchedulingKey &scheduling_key)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   /// Check that the scheduling_key_entries_ hashmap is empty.
-  inline bool CheckNoSchedulingKeyEntries() const EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+  inline bool CheckNoSchedulingKeyEntries() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
     return scheduling_key_entries_.empty();
   }
 
-  /// Find the optimal victim (if there is any) for stealing work
-  ///
-  /// \param[in] scheduling_key The SchedulingKey of the thief.
-  /// \param[in] victim_addr The pointer to a variable that the function will fill with
-  /// the address of the victim, if one is found \param[out] A boolean indicating whether
-  /// we found a suitable victim or not
-  bool FindOptimalVictimForStealing(const SchedulingKey &scheduling_key,
-                                    rpc::WorkerAddress thief_addr,
-                                    rpc::Address *victim_raw_addr)
-      EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  /// Look for workers with a surplus of tasks in flight, and, if it is possible,
-  /// steal some of those tasks and submit them to the current worker. If no tasks
-  /// are available for stealing, return the worker to the Raylet.
-  ///
-  /// \param[in] thief_addr The address of the worker that has finished its own work,
-  ///                       and is ready for stealing.
-  /// \param[in] was_error Whether the last task failed to be submitted to the worker.
-  /// \param[in] scheduling_key The scheduling class of the worker.
-  /// \param[in] assigned_resources Resource ids previously assigned to the worker.
-  void StealTasksOrReturnWorker(
-      const rpc::WorkerAddress &thief_addr, bool was_error,
-      const SchedulingKey &scheduling_key,
-      const google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry> &assigned_resources)
-      EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
   /// Push a task to a specific worker.
-  void PushNormalTask(const rpc::WorkerAddress &addr,
-                      rpc::CoreWorkerClientInterface &client,
+  void PushNormalTask(const rpc::Address &addr,
+                      std::shared_ptr<rpc::CoreWorkerClientInterface> client,
                       const SchedulingKey &task_queue_key,
                       const TaskSpecification &task_spec,
                       const google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry>
                           &assigned_resources);
+
+  /// Handles result from GetTaskFailureCause.
+  void HandleGetTaskFailureCause(
+      const Status &task_execution_status,
+      const bool is_actor,
+      const TaskID &task_id,
+      const rpc::Address &addr,
+      const Status &get_task_failure_cause_reply_status,
+      const rpc::GetTaskFailureCauseReply &get_task_failure_cause_reply);
 
   /// Address of our RPC server.
   rpc::Address rpc_address_;
@@ -221,7 +243,7 @@ class CoreWorkerDirectTaskSubmitter {
 
   /// Cache of gRPC clients to remote raylets.
   absl::flat_hash_map<NodeID, std::shared_ptr<WorkerLeaseInterface>> remote_lease_clients_
-      GUARDED_BY(mu_);
+      ABSL_GUARDED_BY(mu_);
 
   /// Factory for producing new clients to request leases from remote nodes.
   LeaseClientFactoryFn lease_client_factory_;
@@ -259,69 +281,39 @@ class CoreWorkerDirectTaskSubmitter {
   /// The ID of the job.
   const JobID job_id_;
 
-  // max_tasks_in_flight_per_worker_ limits the number of tasks that can be pipelined to a
-  // worker using a single lease.
-  const uint32_t max_tasks_in_flight_per_worker_;
-
-  // Max number of pending lease requests per SchedulingKey.
-  const uint64_t max_pending_lease_requests_per_scheduling_category_;
-
   /// A LeaseEntry struct is used to condense the metadata about a single executor:
   /// (1) The lease client through which the worker should be returned
   /// (2) The expiration time of a worker's lease.
-  /// (3) The number of tasks that are currently in flight to the worker
-  /// (4) A boolean that indicates whether we have launched a StealTasks request, and we
-  /// are waiting for the stolen tasks (5) The resources assigned to the worker (6) The
-  /// SchedulingKey assigned to tasks that will be sent to the worker
+  /// (3) Whether the worker has assigned task to do.
+  /// (5) The resources assigned to the worker
+  /// (6) The SchedulingKey assigned to tasks that will be sent to the worker
+  /// (7) The task id used to obtain the worker lease.
   struct LeaseEntry {
     std::shared_ptr<WorkerLeaseInterface> lease_client;
     int64_t lease_expiration_time;
-    uint32_t tasks_in_flight = 0;
-    bool currently_stealing = false;
+    bool is_busy = false;
     google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry> assigned_resources;
     SchedulingKey scheduling_key;
+    TaskID task_id;
 
     LeaseEntry(
         std::shared_ptr<WorkerLeaseInterface> lease_client = nullptr,
         int64_t lease_expiration_time = 0,
         google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry> assigned_resources =
             google::protobuf::RepeatedPtrField<rpc::ResourceMapEntry>(),
-        SchedulingKey scheduling_key = std::make_tuple(0, std::vector<ObjectID>(),
-                                                       ActorID::Nil(), 0))
+        SchedulingKey scheduling_key =
+            std::make_tuple(0, std::vector<ObjectID>(), ActorID::Nil(), 0),
+        TaskID task_id = TaskID::Nil())
         : lease_client(lease_client),
           lease_expiration_time(lease_expiration_time),
           assigned_resources(assigned_resources),
-          scheduling_key(scheduling_key) {}
-
-    // Check whether the pipeline to the worker associated with a LeaseEntry is full.
-    inline bool PipelineToWorkerFull(uint32_t max_tasks_in_flight_per_worker) const {
-      return tasks_in_flight == max_tasks_in_flight_per_worker;
-    }
-
-    // Check whether the worker is a thief who is in the process of stealing tasks.
-    // Knowing whether a thief is currently stealing is important to prevent the thief
-    // from initiating another StealTasks request or from being returned to the raylet
-    // until stealing has completed.
-    inline bool WorkerIsStealing() const { return currently_stealing; }
-
-    // Once stealing has begun, updated the thief's currently_stealing flag to reflect the
-    // new state.
-    inline void SetWorkerIsStealing() {
-      RAY_CHECK(!currently_stealing);
-      currently_stealing = true;
-    }
-
-    // Once stealing has completed, updated the thief's currently_stealing flag to reflect
-    // the new state.
-    inline void SetWorkerDoneStealing() {
-      RAY_CHECK(currently_stealing);
-      currently_stealing = false;
-    }
+          scheduling_key(scheduling_key),
+          task_id(task_id) {}
   };
 
   // Map from worker address to a LeaseEntry struct containing the lease's metadata.
-  absl::flat_hash_map<rpc::WorkerAddress, LeaseEntry> worker_to_lease_entry_
-      GUARDED_BY(mu_);
+  absl::flat_hash_map<rpc::Address, LeaseEntry> worker_to_lease_entry_
+      ABSL_GUARDED_BY(mu_);
 
   struct SchedulingKeyEntry {
     // Keep track of pending worker lease requests to the raylet.
@@ -332,48 +324,33 @@ class CoreWorkerDirectTaskSubmitter {
     std::deque<TaskSpecification> task_queue = std::deque<TaskSpecification>();
     // Keep track of the active workers, so that we can quickly check if one of them has
     // room for more tasks in flight
-    absl::flat_hash_set<rpc::WorkerAddress> active_workers =
-        absl::flat_hash_set<rpc::WorkerAddress>();
-    // Keep track of how many tasks with this SchedulingKey are in flight, in total
-    uint32_t total_tasks_in_flight = 0;
+    absl::flat_hash_set<rpc::Address> active_workers =
+        absl::flat_hash_set<rpc::Address>();
+    // Keep track of how many workers have tasks to do.
+    uint32_t num_busy_workers = 0;
     int64_t last_reported_backlog_size = 0;
 
     // Check whether it's safe to delete this SchedulingKeyEntry from the
     // scheduling_key_entries_ hashmap.
     inline bool CanDelete() const {
       if (pending_lease_requests.empty() && task_queue.empty() &&
-          active_workers.size() == 0 && total_tasks_in_flight == 0) {
+          active_workers.size() == 0 && num_busy_workers == 0) {
         return true;
       }
 
       return false;
     }
 
-    // Check whether the pipelines to the active workers associated with a
-    // SchedulingKeyEntry are all full.
-    inline bool AllPipelinesToWorkersFull(uint32_t max_tasks_in_flight_per_worker) const {
-      return total_tasks_in_flight >=
-             (active_workers.size() * max_tasks_in_flight_per_worker);
-    }
-
-    // Check whether there exists at least one task that can be stolen
-    inline bool StealableTasks() const {
-      // TODO: Make this function more accurate without introducing excessive
-      // inefficiencies. Currently, there is one scenario where this function can return
-      // false even if there are stealable tasks. This happens if the number of tasks in
-      // flight is less or equal to the number of active workers (so the condition below
-      // evaluates to FALSE), but some workers have more than 1 task queued, while others
-      // have none.
-
-      // If any worker has more than one task in flight, then that task can be stolen.
-      return total_tasks_in_flight > active_workers.size();
+    // Check whether all workers are busy.
+    inline bool AllWorkersBusy() const {
+      RAY_CHECK_LE(num_busy_workers, active_workers.size());
+      return num_busy_workers == active_workers.size();
     }
 
     // Get the current backlog size for this scheduling key
     [[nodiscard]] inline int64_t BacklogSize() const {
       if (task_queue.size() < pending_lease_requests.size()) {
-        // During work stealing we may have more pending lease requests than the number of
-        // queued tasks
+        // This can happen if worker is reused.
         return 0;
       }
 
@@ -386,19 +363,22 @@ class CoreWorkerDirectTaskSubmitter {
   // with the queue of tasks belonging to that SchedulingKey, together with the other
   // fields that are needed to orchestrate the execution of those tasks by the workers.
   absl::flat_hash_map<SchedulingKey, SchedulingKeyEntry> scheduling_key_entries_
-      GUARDED_BY(mu_);
+      ABSL_GUARDED_BY(mu_);
 
   // Tasks that were cancelled while being resolved.
-  absl::flat_hash_set<TaskID> cancelled_tasks_ GUARDED_BY(mu_);
+  absl::flat_hash_set<TaskID> cancelled_tasks_ ABSL_GUARDED_BY(mu_);
 
   // Keeps track of where currently executing tasks are being run.
-  absl::flat_hash_map<TaskID, rpc::WorkerAddress> executing_tasks_ GUARDED_BY(mu_);
+  absl::flat_hash_map<TaskID, rpc::Address> executing_tasks_ ABSL_GUARDED_BY(mu_);
+
+  // Ratelimiter controls the num of pending lease requests.
+  std::shared_ptr<LeaseRequestRateLimiter> lease_request_rate_limiter_;
 
   // Retries cancelation requests if they were not successful.
   absl::optional<boost::asio::steady_timer> cancel_retry_timer_;
 
   int64_t num_tasks_submitted_ = 0;
-  int64_t num_leases_requested_ GUARDED_BY(mu_) = 0;
+  int64_t num_leases_requested_ ABSL_GUARDED_BY(mu_) = 0;
 };
 
 }  // namespace core

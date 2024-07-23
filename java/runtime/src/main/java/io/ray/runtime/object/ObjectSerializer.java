@@ -3,15 +3,16 @@ package io.ray.runtime.object;
 import com.google.common.collect.ImmutableList;
 import com.google.common.primitives.Bytes;
 import com.google.protobuf.InvalidProtocolBufferException;
+import io.ray.api.exception.RayActorException;
+import io.ray.api.exception.RayException;
+import io.ray.api.exception.RayTaskException;
+import io.ray.api.exception.RayWorkerException;
+import io.ray.api.exception.UnreconstructableException;
 import io.ray.api.id.ActorId;
 import io.ray.api.id.ObjectId;
 import io.ray.runtime.actor.NativeActorHandle;
-import io.ray.runtime.exception.RayActorException;
-import io.ray.runtime.exception.RayException;
-import io.ray.runtime.exception.RayTaskException;
-import io.ray.runtime.exception.RayWorkerException;
-import io.ray.runtime.exception.UnreconstructableException;
 import io.ray.runtime.generated.Common.ErrorType;
+import io.ray.runtime.serializer.RayExceptionSerializer;
 import io.ray.runtime.serializer.Serializer;
 import io.ray.runtime.util.IdUtil;
 import java.nio.ByteBuffer;
@@ -32,6 +33,8 @@ public class ObjectSerializer {
       String.valueOf(ErrorType.WORKER_DIED.getNumber()).getBytes();
   private static final byte[] ACTOR_EXCEPTION_META =
       String.valueOf(ErrorType.ACTOR_DIED.getNumber()).getBytes();
+  private static final byte[] ACTOR_UNAVAILABLE_EXCEPTION_META =
+      String.valueOf(ErrorType.ACTOR_UNAVAILABLE.getNumber()).getBytes();
   private static final byte[] UNRECONSTRUCTABLE_EXCEPTION_META =
       String.valueOf(ErrorType.OBJECT_UNRECONSTRUCTABLE.getNumber()).getBytes();
   private static final byte[] UNRECONSTRUCTABLE_LINEAGE_EVICTED_EXCEPTION_META =
@@ -89,6 +92,10 @@ public class ObjectSerializer {
         return Serializer.decode(data, objectType);
       } else if (Bytes.indexOf(meta, WORKER_EXCEPTION_META) == 0) {
         return new RayWorkerException();
+      } else if (Bytes.indexOf(meta, ACTOR_UNAVAILABLE_EXCEPTION_META) == 0) {
+        // TODO(ryw): Add a new exception type ActorUnavailableException.
+        // Also clean up the indexOf usage, should use equals.
+        return new RayActorException();
       } else if (Bytes.indexOf(meta, UNRECONSTRUCTABLE_EXCEPTION_META) == 0
           || Bytes.indexOf(meta, UNRECONSTRUCTABLE_LINEAGE_EVICTED_EXCEPTION_META) == 0
           || Bytes.indexOf(meta, UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED_EXCEPTION_META) == 0
@@ -100,7 +107,7 @@ public class ObjectSerializer {
       } else if (Bytes.indexOf(meta, ACTOR_EXCEPTION_META) == 0) {
         ActorId actorId = IdUtil.getActorIdFromObjectId(objectId);
         if (data != null && data.length > 0) {
-          RayException exception = deserializeRayException(data, objectId);
+          RayException exception = deserializeActorException(data, actorId, objectId);
           if (exception != null) {
             return exception;
           }
@@ -148,7 +155,8 @@ public class ObjectSerializer {
       return new NativeRayObject(bytes, OBJECT_METADATA_TYPE_RAW);
     } else if (object instanceof RayTaskException) {
       RayTaskException taskException = (RayTaskException) object;
-      byte[] serializedBytes = Serializer.encode(taskException.toBytes()).getLeft();
+      byte[] serializedBytes =
+          Serializer.encode(RayExceptionSerializer.toBytes(taskException)).getLeft();
       // serializedBytes is MessagePack serialized bytes
       // taskException.toBytes() is protobuf serialized bytes
       // Only OBJECT_METADATA_TYPE_RAW is raw bytes,
@@ -207,7 +215,30 @@ public class ObjectSerializer {
 
   private static RayException deserializeRayException(byte[] msgPackData, ObjectId objectId) {
     // Serialization logic of task execution exception: an instance of
-    // `io.ray.runtime.exception.RayTaskException`
+    // `io.ray.api.exception.RayTaskException`
+    //    -> a `RayException` protobuf message
+    //    -> protobuf-serialized bytes
+    //    -> MessagePack-serialized bytes.
+    // So here the `data` variable is MessagePack-serialized bytes, and the `serialized`
+    // variable is protobuf-serialized bytes. They are not the same.
+    byte[] pbData = Serializer.decode(msgPackData, byte[].class);
+
+    if (pbData == null || pbData.length == 0) {
+      // No RayException provided
+      return null;
+    }
+    try {
+      return RayExceptionSerializer.fromBytes(pbData);
+    } catch (InvalidProtocolBufferException e) {
+      throw new IllegalArgumentException(
+          "Can't deserialize RayActorCreationTaskException object: " + objectId.toString(), e);
+    }
+  }
+
+  private static RayException deserializeActorException(
+      byte[] msgPackData, ActorId actorId, ObjectId objectId) {
+    // Serialization logic of task execution exception: an instance of
+    // `io.ray.api.exception.RayTaskException`
     //    -> a `RayException` protobuf message
     //    -> protobuf-serialized bytes
     //    -> MessagePack-serialized bytes.
@@ -221,10 +252,19 @@ public class ObjectSerializer {
     }
 
     try {
-      return RayException.fromBytes(pbData);
+      io.ray.runtime.generated.Common.RayErrorInfo rayErrorInfo =
+          io.ray.runtime.generated.Common.RayErrorInfo.parseFrom(pbData);
+      if (rayErrorInfo.getActorDiedError().hasCreationTaskFailureContext()) {
+        return RayExceptionSerializer.fromRayExceptionPB(
+            rayErrorInfo.getActorDiedError().getCreationTaskFailureContext());
+      } else {
+        // TODO(lixin) Generate friendly error message from RayErrorInfo.ActorDiedError's field
+        // type.
+        return new RayActorException(actorId);
+      }
     } catch (InvalidProtocolBufferException e) {
       throw new IllegalArgumentException(
-          "Can't deserialize RayActorCreationTaskException object: " + objectId.toString());
+          "Can't deserialize RayActorCreationTaskException object: " + objectId.toString(), e);
     }
   }
 }
